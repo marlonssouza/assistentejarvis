@@ -1,0 +1,54 @@
+"""Convenience runner: terminal mode (default) or web UI.
+
+Usage:
+  python -m jarvis.app                # terminal (existing behavior)
+  python -m jarvis.app --ui           # web dashboard
+  python -m jarvis.app --ui --no-browser  # don't auto-open browser
+"""
+
+import argparse
+import asyncio
+import logging
+
+logging.basicConfig(
+    level=logging.INFO,
+    format="%(asctime)s %(levelname)s %(name)s: %(message)s",
+)
+
+
+def main() -> None:
+    parser = argparse.ArgumentParser(description="J.A.R.V.I.S.")
+    parser.add_argument("--ui", "--web", action="store_true", dest="ui")
+    parser.add_argument("--no-browser", action="store_true")
+    args = parser.parse_args()
+
+    if args.ui:
+        from jarvis.server import run
+
+        run(open_browser=not args.no_browser)
+        return
+
+    from jarvis.config import LIVE_MODE, get_gemini_api_key, ConfigurationError
+    from main import main as terminal_main
+
+    try:
+        get_gemini_api_key()
+    except ConfigurationError as exc:
+        logging.error("%s", exc)
+        return
+
+    if LIVE_MODE:
+        try:
+            from jarvis.live import run_live_session
+
+            asyncio.run(run_live_session())
+            return
+        except Exception as exc:  # noqa: BLE001
+            logging.exception("Modo Live indisponível; voltando ao modo padrão.")
+            print(f"[Jarvis] Modo Live indisponível ({exc}); usando o modo padrão.")
+
+    asyncio.run(terminal_main())
+
+
+if __name__ == "__main__":
+    main()

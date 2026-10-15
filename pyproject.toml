@@ -1,0 +1,40 @@
+[build-system]
+requires = ["setuptools>=67", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "jarvis-cross-platform"
+version = "0.7.0"
+description = "J.A.R.V.I.S. - assistente pessoal com interface web e voz natural"
+readme = "README.md"
+authors = [{ name = "J.A.R.V.I.S." }]
+requires-python = ">=3.11"
+dependencies = [
+    "fastapi>=0.115.0",
+    "uvicorn[standard]>=0.30.0",
+    "google-genai>=1.0.0",
+    "SpeechRecognition[audio]>=3.14.0",
+    "PyAudio>=0.2.14",
+    "edge-tts>=7.0.0",
+    "gTTS>=2.5.0",
+    "mss>=10.0.0",
+    "pyautogui>=0.9.54",
+    "pyperclip>=1.9.0",
+    "Pillow>=10.0.0",
+    "httpx>=0.27.0",
+    "python-dotenv>=1.0.0",
+    "playwright>=1.40.0",
+    "psutil>=6.0.0",
+    "screen-brightness-control>=0.23.0",
+    "pycaw>=20240210; sys_platform == 'win32'",
+    "google-api-python-client>=2.150.0",
+    "google-auth-httplib2>=0.2.0",
+    "google-auth-oauthlib>=1.2.0",
+]
+
+[tool.setuptools.packages.find]
+include = ["jarvis*"]
+
+[project.scripts]
+jarvis = "jarvis.app:main"
+jarvis-ui = "jarvis.server:run"

@@ -1,0 +1,18 @@
+{
+  "servers": [
+    {
+      "name": "filesystem",
+      "transport": "stdio",
+      "command": "npx",
+      "args": ["-y", "@modelcontextprotocol/server-filesystem", "C:\\Users\\SeuUsuario\\Documents"],
+      "enabled": false
+    },
+    {
+      "name": "remoto-exemplo",
+      "transport": "http",
+      "url": "https://exemplo.com/mcp",
+      "headers": { "Authorization": "Bearer SEU_TOKEN_AQUI" },
+      "enabled": false
+    }
+  ]
+}

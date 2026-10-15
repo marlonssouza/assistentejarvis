@@ -1,0 +1,19 @@
+google-genai
+mss
+Pillow
+pyautogui
+SpeechRecognition[audio]
+gTTS
+python-dotenv
+edge-tts
+google-api-python-client
+google-auth-oauthlib
+httpx
+playwright
+psutil
+pyperclip
+screen-brightness-control
+pycaw; sys_platform == "win32"
+mcp
+fastapi
+uvicorn[standard]

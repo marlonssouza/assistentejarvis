@@ -1,0 +1,44 @@
+# Ambientes Virtuais
+.venv/
+venv/
+ENV/
+env/
+
+# Configurações locais e segredos
+.env
+.env.local
+.env.*.local
+credentials.json
+token.json
+
+# Caches e Bytecode Python
+__pycache__/
+*.py[cod]
+*$py.class
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+.coverage
+htmlcov/
+
+# Armazenamento e Runtime do Jarvis
+.jarvis/
+.jarvis_memory.json
+memory.json
+response.mp3
+screen.png
+*.tmp.mp3
+*.tmp.png
+
+# Build e Distribuição
+build/
+dist/
+*.egg-info/
+*.egg
+
+# IDEs e Sistema Operacional
+.vscode/
+.idea/
+.DS_Store
+Thumbs.db
+desktop.ini
