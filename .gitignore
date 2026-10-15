@@ -10,6 +10,8 @@ env/
 .env.*.local
 credentials.json
 token.json
+client_secret*.json
+oauth*-secret*.json
 
 # Caches e Bytecode Python
 __pycache__/

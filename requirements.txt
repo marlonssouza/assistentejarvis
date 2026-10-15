@@ -3,11 +3,13 @@ mss
 Pillow
 pyautogui
 SpeechRecognition[audio]
+PyAudio
 gTTS
 python-dotenv
 edge-tts
 google-api-python-client
 google-auth-oauthlib
+google-auth-httplib2
 httpx
 playwright
 psutil
