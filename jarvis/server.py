@@ -36,6 +36,32 @@ _CONFIRM_TIMEOUT = 180
 app = FastAPI(title="J.A.R.V.I.S.")
 
 
+def _friendly_error(exc: Exception) -> str:
+    """Traduz erros técnicos comuns em mensagens claras para o usuário."""
+    text = str(exc)
+    low = text.lower()
+    if "429" in text or "resource_exhausted" in low or "quota" in low:
+        return (
+            "A cota do provedor de IA está esgotada no momento "
+            "(limite de requisições/dia atingido). Tente novamente mais tarde "
+            "ou configure outro provedor em JARVIS_PROVIDER."
+        )
+    if (
+        "401" in text
+        or "unauthenticated" in low
+        or "api key" in low
+        or "permission" in low
+        or "invalid_argument" in low
+    ):
+        return (
+            "A chave de API está inválida ou sem permissão. "
+            "Confira a chave do provedor no arquivo .env."
+        )
+    if "timeout" in low or "timed out" in low or "deadline" in low:
+        return "O provedor de IA demorou demais para responder. Tente novamente."
+    return text
+
+
 def is_authorized(token: str | None) -> bool:
     """Verifica se o token informado confere com JARVIS_UI_TOKEN (se configurado)."""
     expected = getattr(config, "UI_TOKEN", "") or ""
@@ -138,7 +164,7 @@ class Session:
             reply = await asyncio.to_thread(chat_with_vision, text, None)
         except Exception as exc:  # noqa: BLE001 - reportar ao usuário
             logger.exception("Falha ao processar o pedido.")
-            self.emit({"type": "error", "text": str(exc)})
+            self.emit({"type": "error", "text": _friendly_error(exc)})
             self.emit({"type": "status", "state": "idle"})
         else:
             self.emit({"type": "assistant", "text": reply})
@@ -216,6 +242,16 @@ async def websocket_endpoint(websocket: WebSocket) -> None:
     events.subscribe(session.emit)
     security.register_confirm_handler(session.confirm)
     sender = asyncio.create_task(session.sender())
+    tasks: set[asyncio.Task] = set()
+
+    def _on_task_done(task: asyncio.Task) -> None:
+        tasks.discard(task)
+        if task.cancelled():
+            return
+        exc = task.exception()
+        if exc is not None:
+            logger.debug("Tarefa da interface terminou com erro: %s", exc)
+
     try:
         session.emit({"type": "ready", "skills": skills_payload()})
         while True:
@@ -224,12 +260,26 @@ async def websocket_endpoint(websocket: WebSocket) -> None:
                 message = json.loads(raw)
             except ValueError:
                 continue
-            await _route(session, message)
+            # A confirmação é respondida imediatamente, sem esperar o pedido em
+            # curso terminar: sem isso o clique em Aprovar/Recusar fica preso na
+            # fila de leitura enquanto o pedido anterior ainda está executando.
+            if message.get("type") == "confirm":
+                session.resolve(message.get("id", ""), message.get("approved", False))
+                continue
+            # Roda o pedido em segundo plano para que o loop continue lendo
+            # (inclusive novas confirmações) enquanto ele é executado.
+            task = asyncio.create_task(_route(session, message))
+            tasks.add(task)
+            task.add_done_callback(_on_task_done)
     except WebSocketDisconnect:
         pass
+    except asyncio.CancelledError:
+        raise
     except Exception:  # noqa: BLE001
         logger.exception("Erro na conexão da interface.")
     finally:
+        for task in list(tasks):
+            task.cancel()
         events.unsubscribe(session.emit)
         security.register_confirm_handler(None)
         sender.cancel()

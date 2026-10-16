@@ -112,6 +112,87 @@ class WebSocketTests(unittest.TestCase):
             audio["data"], base64.b64encode(audio_bytes).decode("ascii")
         )
 
+    def test_confirmation_over_websocket_is_processed(self):
+        """Regressão do travamento: o clique em Aprovar precisa ser lido mesmo
+        com um pedido em andamento (o loop precisa continuar lendo o /ws)."""
+        from jarvis import security
+
+        def fake_chat(text, image=None):
+            ok = security.confirm_action("abrir calculadora", risk=security.DANGEROUS)
+            return "executado=%s" % ok
+
+        with (
+            patch.object(server, "chat_with_vision", side_effect=fake_chat),
+            patch.object(server.voice, "synthesize_mp3", return_value=b"ID3fake"),
+        ):
+            with TestClient(server.app) as client:
+                with client.websocket_connect("/ws") as ws:
+                    ws.receive_json()  # ready
+                    ws.send_json({"type": "user_text", "text": "abra o calculador"})
+                    approved_sent = False
+                    received = []
+                    for _ in range(15):
+                        message = ws.receive_json()
+                        received.append(message)
+                        if message["type"] == "confirm_request" and not approved_sent:
+                            ws.send_json(
+                                {
+                                    "type": "confirm",
+                                    "id": message["id"],
+                                    "approved": True,
+                                }
+                            )
+                            approved_sent = True
+                        if message["type"] == "assistant":
+                            break
+        types = [m["type"] for m in received]
+        self.assertIn("confirm_request", types)
+        self.assertTrue(approved_sent)
+        assistant = next(m for m in received if m["type"] == "assistant")
+        self.assertIn("executado=True", assistant["text"])
+
+    def test_quota_error_is_reported_in_friendly_way(self):
+        def fake_chat(text, image=None):
+            raise Exception(
+                "429 RESOURCE_EXHAUSTED. quota exceeded for gemini-2.5-flash"
+            )
+
+        with (
+            patch.object(server, "chat_with_vision", side_effect=fake_chat),
+            patch.object(server.voice, "synthesize_mp3", return_value=b"ID3fake"),
+        ):
+            with TestClient(server.app) as client:
+                with client.websocket_connect("/ws") as ws:
+                    ws.receive_json()  # ready
+                    ws.send_json({"type": "user_text", "text": "oi"})
+                    received = []
+                    for _ in range(8):
+                        message = ws.receive_json()
+                        received.append(message)
+                        if message["type"] == "error":
+                            break
+        error = next(m for m in received if m["type"] == "error")
+        self.assertIn("cota", error["text"].lower())
+        self.assertNotIn("RESOURCE_EXHAUSTED", error["text"])
+
+    def test_friendly_error_mapping(self):
+        self.assertIn(
+            "cota",
+            server._friendly_error(
+                Exception("429 RESOURCE_EXHAUSTED quota exceeded")
+            ).lower(),
+        )
+        self.assertIn(
+            "chave de api",
+            server._friendly_error(
+                Exception("401 UNAUTHENTICATED api key not valid")
+            ).lower(),
+        )
+        self.assertEqual(
+            server._friendly_error(Exception("problema qualquer")),
+            "problema qualquer",
+        )
+
 
 class SessionTests(unittest.IsolatedAsyncioTestCase):
     class FakeWebSocket:
