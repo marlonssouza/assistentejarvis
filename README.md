@@ -136,7 +136,72 @@ AÃ§Ãµes de **risco** (pedem confirmaÃ§Ã£o):
 - `mcp_call` â€” chama uma ferramenta de um servidor MCP externo (exige confirmaÃ§Ã£o).
 - `run_command` â€” executa um comando de shell.
 
+## Rotina, clima e automacao
+
+Ferramentas **seguras** adicionadas para o dia a dia:
+
+- `get_weather` — clima atual e previsao. Usa a chave `OPENWEATHER_API_KEY`
+  (se configurada) e cai automaticamente para **Open-Meteo** (sem chave) e
+  **wttr.in**, garantindo resposta mesmo sem chave.
+- `daily_briefing` — monta o resumo do dia: data/hora, clima, lembretes
+  pendentes e e-mails nao lidos. Ideal para uma saudacao proativa.
+- `take_quick_note` / `append_quick_note` / `list_quick_notes` — anotacoes
+  rapidas em Markdown nas pastas autorizadas (otimo para ditado).
+- `play_media` — busca e abre videos/musicas no navegador (YouTube por padrao).
+- `schedule_task` / `list_scheduled` / `cancel_task` — agenda tarefas futuras
+  (`"HH:MM"`, `"in 30"` minutos ou ISO), com repeticao `daily` opcional.
+- `network_diagnostics` — diagnostico de rede somente leitura (ping em gateway
+  e DNS publicos, teste de DNS, status de conectividade).
+
+Ferramentas de **risco** (pedem confirmacao):
+
+- `network_fix` — reparo de rede no Windows (release/renew de IP, flush e
+  register de DNS); **cada etapa pede confirmacao explicita**.
+- `network_autorepair` — diagnostica e, se estiver offline, executa o reparo
+  com confirmacao.
+
+Variaveis de ambiente relacionadas:
+
+```dotenv
+# Frases de ativacao variadas ("As suas ordens", "Pois nao"...). Padrao: false.
+JARVIS_WAKE_DYNAMIC=false
+# Cria automaticamente um briefing diario as 08:00. Padrao: false.
+JARVIS_DAILY_BRIEFING_AUTO=false
+# Interface: "web" (padrao) ou "compact" (janela Tkinter + bandeja).
+JARVIS_UI_MODE=web
+```
+
+## Interface compacta (Tkinter + bandeja)
+
+Alem do painel web, ha uma **interface compacta opcional** – uma janela pequena
+estilo orbe, com icone na bandeja do sistema. Ela **nao substitui** a
+arquitetura atual: conversa com o **mesmo servidor** (FastAPI/WebSocket), pelo
+mesmo `/ws`, com as mesmas ferramentas, confirmacoes e memoria.
+
+Ativar (mantendo o modo web como padrao):
+
+```bash
+# Opcao 1: variavel de ambiente
+set JARVIS_UI_MODE=compact
+python -m jarvis.app --ui
+
+# Opcao 2: lancador dedicado (sobe o servidor em background)
+python -m jarvis.compact_app
+# ou, se instalado: jarvis-compact
+
+# Opcao 3: forcar pela linha de comando
+python -m jarvis.app --ui --compact
+```
+
+O icone de bandeja usa `pystray` (opcional). Se nao estiver instalado, a janela
+funciona normalmente e o tray e apenas ignorado:
+
+```bash
+pip install "jarvis-cross-platform[tray]"
+```
+
 ## Web e e-mail
+
 
 - **Pesquisar e ler sites:** peÃ§a "pesquise X" (o Jarvis usa o Google e responde
   com dados atuais e fontes) ou "abra e leia o site Y" para ele baixar a pÃ¡gina e

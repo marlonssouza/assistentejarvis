@@ -19,8 +19,19 @@ logging.basicConfig(
 def main() -> None:
     parser = argparse.ArgumentParser(description="J.A.R.V.I.S.")
     parser.add_argument("--ui", "--web", action="store_true", dest="ui")
+    parser.add_argument("--compact", action="store_true", help="Força a interface compacta (Tkinter)")
     parser.add_argument("--no-browser", action="store_true")
     args = parser.parse_args()
+
+    from jarvis.config import UI_MODE
+
+    use_compact = args.compact or UI_MODE == "compact"
+
+    if args.ui and use_compact:
+        from jarvis.compact_app import main as compact_main
+
+        compact_main()
+        return
 
     if args.ui:
         from jarvis.server import run

@@ -183,6 +183,14 @@ OPENAI_BASE_URL = os.getenv(
 OPENAI_API_KEY = os.getenv("JARVIS_OPENAI_API_KEY", "").strip()
 OPENAI_MODEL = os.getenv("JARVIS_OPENAI_MODEL", "gpt-4o-mini").strip()
 
+# Interface e comportamento
+UI_MODE = _read_choice("JARVIS_UI_MODE", "web", {"web", "compact"})
+WAKE_DYNAMIC = _read_bool("JARVIS_WAKE_DYNAMIC", False)
+DAILY_BRIEFING_AUTO = _read_bool("JARVIS_DAILY_BRIEFING_AUTO", False)
+
+# Clima: chave opcional do OpenWeather. Sem ela, o clima usa Open-Meteo/wttr.in.
+OPENWEATHER_API_KEY = os.getenv("OPENWEATHER_API_KEY", "").strip()
+
 
 def active_model_name() -> str:
     """Nome do modelo do provedor ativo."""

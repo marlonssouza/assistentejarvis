@@ -33,9 +33,15 @@ dependencies = [
     "mcp>=1.0.0",
 ]
 
+[project.optional-dependencies]
+# Interface compacta opcional (Tkinter + ícone de bandeja).
+tray = ["pystray>=0.19.5", "Pillow>=10.0.0"]
+# Diagnóstico de rede opcional já usa apenas ferramentas nativas do sistema.
+
 [tool.setuptools.packages.find]
 include = ["jarvis*"]
 
 [project.scripts]
 jarvis = "jarvis.app:main"
 jarvis-ui = "jarvis.server:run"
+jarvis-compact = "jarvis.compact_app:main"

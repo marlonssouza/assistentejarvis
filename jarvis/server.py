@@ -235,9 +235,47 @@ async def websocket_endpoint(websocket: WebSocket) -> None:
         sender.cancel()
 
 
+def start_background_services() -> None:
+    """Inicia serviços de background opcionais (agendador e briefing diário).
+
+    Tudo é aditivo e defensivo: qualquer falha aqui não impede o servidor de
+    subir nem altera o comportamento atual quando as flags estão desligadas.
+    """
+    try:
+        from . import hands, scheduler
+
+        def _on_reminder(task: dict) -> None:
+            events.emit(
+                {"type": "info", "text": f"⏰ Lembrete: {task.get('name', 'tarefa')}"}
+            )
+
+        def _on_briefing(task: dict) -> None:
+            try:
+                events.emit({"type": "info", "text": hands.daily_briefing()})
+            except Exception:  # noqa: BLE001
+                logger.exception("Falha ao gerar o briefing diário.")
+
+        scheduler.register_callback("reminder", _on_reminder)
+        scheduler.register_callback("briefing", _on_briefing)
+
+        if getattr(config, "DAILY_BRIEFING_AUTO", False):
+            existing = {
+                t.get("name") for t in scheduler.list_scheduled() if not t.get("fired")
+            }
+            if "briefing_diario" not in existing:
+                scheduler.schedule_task(
+                    name="briefing_diario", when="08:00", kind="briefing", repeat="daily"
+                )
+
+        scheduler.start()
+    except Exception:  # noqa: BLE001
+        logger.exception("Falha ao iniciar serviços de background.")
+
+
 def run(open_browser: bool = True) -> None:
     """Sobe o servidor local e abre a interface no navegador."""
     get_gemini_api_key()  # falha cedo se a chave não estiver configurada
+    start_background_services()
     token = getattr(config, "UI_TOKEN", "") or ""
     query = f"?token={token}" if token else ""
     url = f"http://{UI_HOST}:{UI_PORT}{query}"

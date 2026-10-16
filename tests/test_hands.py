@@ -361,5 +361,58 @@ class HandsTests(unittest.TestCase):
         self.assertEqual(hands.TOOL_RISK["mcp_call"], hands.DANGEROUS)
 
 
+class NewToolsTests(unittest.TestCase):
+    def test_get_weather_delegates_to_weather_module(self):
+        with patch("jarvis.weather.get_weather", return_value='{"source": "test"}') as getter:
+            raw = hands.get_weather("São Paulo")
+        self.assertEqual(raw, '{"source": "test"}')
+        getter.assert_called_once_with(city="São Paulo", lat=None, lon=None)
+
+    def test_quick_notes_roundtrip(self):
+        with tempfile.TemporaryDirectory() as temp_dir:
+            root = Path(temp_dir)
+            with patch.object(hands, "ALLOWED_FILES_DIR", root):
+                created = json.loads(
+                    hands.take_quick_note("minha_nota", content="linha um")
+                )
+                self.assertTrue(created["created"])
+                appended = json.loads(
+                    hands.append_quick_note("minha_nota", content="linha dois")
+                )
+                self.assertTrue(appended["appended"])
+                listing = json.loads(hands.list_quick_notes())
+                names = [n["name"] for n in listing["notes"]]
+                self.assertTrue(any(n.startswith("minha_nota") for n in names))
+                self.assertIn(
+                    "linha dois",
+                    Path(appended["path"]).read_text(encoding="utf-8"),
+                )
+
+    def test_quick_note_is_confined_to_allowed_dir(self):
+        with tempfile.TemporaryDirectory() as temp_dir:
+            root = Path(temp_dir)
+            with patch.object(hands, "ALLOWED_FILES_DIR", root):
+                with self.assertRaisesRegex(ValueError, "fora"):
+                    hands.list_quick_notes(folder="..")
+
+    def test_play_media_requires_query(self):
+        with self.assertRaises(ValueError):
+            hands.play_media("")
+
+    def test_new_tools_risk_map(self):
+        self.assertEqual(hands.TOOL_RISK["get_weather"], hands.SAFE)
+        self.assertEqual(hands.TOOL_RISK["take_quick_note"], hands.SAFE)
+        self.assertEqual(hands.TOOL_RISK["append_quick_note"], hands.SAFE)
+        self.assertEqual(hands.TOOL_RISK["list_quick_notes"], hands.SAFE)
+        self.assertEqual(hands.TOOL_RISK["daily_briefing"], hands.SAFE)
+        self.assertEqual(hands.TOOL_RISK["play_media"], hands.SAFE)
+        self.assertEqual(hands.TOOL_RISK["network_diagnostics"], hands.SAFE)
+        self.assertEqual(hands.TOOL_RISK["network_fix"], hands.DANGEROUS)
+        self.assertEqual(hands.TOOL_RISK["network_autorepair"], hands.DANGEROUS)
+        self.assertEqual(hands.TOOL_RISK["schedule_task"], hands.SAFE)
+        self.assertEqual(hands.TOOL_RISK["list_scheduled"], hands.SAFE)
+        self.assertEqual(hands.TOOL_RISK["cancel_task"], hands.SAFE)
+
+
 if __name__ == "__main__":
     unittest.main()

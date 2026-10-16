@@ -9,6 +9,7 @@ from jarvis.brain import chat_with_vision, reset_conversation
 from jarvis.config import (
     ConfigurationError,
     LIVE_MODE,
+    WAKE_DYNAMIC,
     WAKE_ENABLED,
     WAKE_WORDS,
     get_gemini_api_key,
@@ -84,7 +85,12 @@ async def _next_query(system_os: str, state: dict[str, bool]) -> str | None:
         else:
             if not activated:
                 return None
-            await speak_text("Sim?")
+            wake_reply = "Sim?"
+            if WAKE_DYNAMIC:
+                from jarvis.personality import get_wake_response
+
+                wake_reply = get_wake_response()
+            await speak_text(wake_reply)
             return await _listen_for_query(state)
 
     line = await _input_line(f"\n[Comando para o Jarvis ({system_os})] >>> ")

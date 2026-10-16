@@ -415,6 +415,127 @@ def list_reminders() -> str:
     return json.dumps(system.list_reminders(), ensure_ascii=False)
 
 
+def get_weather(city: str | None = None, lat: float | None = None, lon: float | None = None) -> str:
+    """Obtém informações meteorológicas atuais com fallbacks (SAFE)."""
+    from . import weather
+
+    return weather.get_weather(city=city, lat=lat, lon=lon)
+
+
+def take_quick_note(title: str | None = None, content: str = "", folder: str = "Documents") -> str:
+    """Cria uma anotação rápida (SAFE). Salva em pasta autorizada."""
+    from datetime import datetime
+
+    safe_content = content or ""
+    ts = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+    name_base = (title or "nota").strip() or "nota"
+    fname = f"{name_base.replace(' ', '_')}_{datetime.now().strftime('%Y%m%d_%H%M%S')}.md"
+    candidate_rel = f"{folder}/{fname}" if folder else fname
+    candidate = _safe_path(candidate_rel)
+    candidate.parent.mkdir(parents=True, exist_ok=True)
+    text = f"# {title or 'Nota Rápida'}\n\nData: {ts}\n\n{safe_content}\n"
+    candidate.write_text(text, encoding="utf-8")
+    return json.dumps({"path": str(candidate), "created": True}, ensure_ascii=False)
+
+
+def append_quick_note(title: str, content: str = "", folder: str = "Documents") -> str:
+    """Acrescenta conteúdo a uma nota existente (SAFE)."""
+    from datetime import datetime
+
+    name_base = (title or "nota").strip() or "nota"
+    fname = f"{name_base.replace(' ', '_')}.md"
+    candidate_rel = f"{folder}/{fname}" if folder else fname
+    candidate = _safe_path(candidate_rel)
+    candidate.parent.mkdir(parents=True, exist_ok=True)
+    ts = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+    with candidate.open("a", encoding="utf-8") as f:
+        f.write(f"\n## {ts}\n\n{content}\n")
+    return json.dumps({"path": str(candidate), "appended": True}, ensure_ascii=False)
+
+
+def list_quick_notes(folder: str = "Documents", limit: int = 20) -> str:
+    """Lista notas rápidas (SAFE)."""
+    candidate = _safe_path(folder)
+    if not candidate.exists() or not candidate.is_dir():
+        return json.dumps({"notes": []}, ensure_ascii=False)
+    notes = []
+    for p in sorted(candidate.glob("*.md"), key=lambda x: x.stat().st_mtime, reverse=True)[:limit]:
+        try:
+            notes.append({"name": p.name, "path": str(p), "size": p.stat().st_size})
+        except Exception:
+            continue
+    return json.dumps({"notes": notes}, ensure_ascii=False)
+
+
+def daily_briefing(city: str | None = None, include_email: bool = True) -> str:
+    """Monta o briefing diário (SAFE): data/hora, clima, lembretes e e-mails."""
+    from datetime import datetime
+
+    from . import weather as weather_mod
+
+    now = datetime.now()
+    briefing: dict = {
+        "date": now.strftime("%Y-%m-%d %H:%M:%S"),
+        "weekday": now.strftime("%A"),
+    }
+
+    try:
+        briefing["weather"] = json.loads(weather_mod.get_weather(city=city))
+    except Exception as exc:
+        briefing["weather"] = {"error": str(exc)}
+
+    try:
+        briefing["reminders"] = json.loads(list_reminders())
+    except Exception as exc:
+        briefing["reminders"] = {"error": str(exc)}
+
+    if include_email:
+        try:
+            raw = list_emails(max_results=5, query="is:unread")
+            parsed = json.loads(raw) if isinstance(raw, str) else raw
+            if isinstance(parsed, list):
+                briefing["unread_emails"] = len(parsed)
+                briefing["emails"] = parsed[:5]
+            elif isinstance(parsed, dict):
+                emails = parsed.get("emails") or parsed.get("items") or []
+                briefing["unread_emails"] = parsed.get("total", len(emails))
+                briefing["emails"] = emails[:5]
+        except Exception as exc:
+            briefing["unread_emails"] = None
+            briefing["emails_error"] = str(exc)
+
+    try:
+        recent = recall(query="agenda reunião compromisso", limit=3)
+        parsed = json.loads(recent) if isinstance(recent, str) else recent
+        if isinstance(parsed, dict):
+            briefing["memory_context"] = (parsed.get("facts") or [])[:3]
+    except Exception:
+        briefing["memory_context"] = []
+
+    return json.dumps(briefing, ensure_ascii=False, default=str)
+
+
+def play_media(query: str, platform: str = "youtube", open_first: bool = True) -> str:
+    """Busca e abre mídia (YouTube por padrão). SAFE."""
+    from urllib.parse import quote_plus
+
+    if not query or not query.strip():
+        raise ValueError("Informe a consulta para buscar mídia.")
+    q = quote_plus(query.strip())
+    platform_l = platform.lower()
+    if platform_l == "youtube":
+        url = f"https://www.youtube.com/results?search_query={q}"
+    else:
+        url = f"https://www.google.com/search?q={q}"
+    res = browser_auto.open_page(url)
+    try:
+        data = json.loads(res) if isinstance(res, str) else res
+    except Exception:
+        data = {"url": url, "result": res}
+    payload = {"platform": platform_l, "query": query, "search_url": url, "opened": True, **data}
+    return json.dumps(payload, ensure_ascii=False)
+
+
 def browser_open(url: str) -> str:
     """Abre uma URL no navegador controlado (Playwright) para interagir depois."""
     return browser_auto.open_page(url)
@@ -563,6 +684,132 @@ def run_command(command: str) -> str:
     )
 
 
+def network_diagnostics() -> str:
+    """Diagnóstico de rede (apenas leitura, SAFE). Testa gateway, DNS e latência."""
+    if platform.system() != "Windows":
+        return json.dumps({"error": "Diagnóstico disponível apenas no Windows."}, ensure_ascii=False)
+
+    results: dict = {"tests": [], "os": platform.system()}
+
+    def _ping(target: str, count: int = 2, timeout_ms: int = 2000) -> dict:
+        cmd = ["ping", "-n", str(count), "-w", str(timeout_ms), target]
+        try:
+            proc = subprocess.run(cmd, capture_output=True, text=True, timeout=COMMAND_TIMEOUT_SECONDS)
+            out = (proc.stdout or "")
+            latencies = []
+            for line in out.splitlines():
+                if "tempo=" in line.lower() or "time=" in line.lower():
+                    try:
+                        part = line.split("=")[-1].replace("ms", "").strip()
+                        latencies.append(int("".join(c for c in part if c.isdigit())))
+                    except Exception:
+                        pass
+            return {
+                "target": target,
+                "ok": proc.returncode == 0,
+                "latency_ms": latencies[-1] if latencies else None,
+                "output": out[:500],
+            }
+        except Exception as exc:
+            return {"target": target, "ok": False, "error": str(exc)}
+
+    gateway = None
+    try:
+        ipconfig = subprocess.run(["ipconfig"], capture_output=True, text=True, timeout=COMMAND_TIMEOUT_SECONDS)
+        for line in (ipconfig.stdout or "").splitlines():
+            if "Gateway Padr" in line or "Default Gateway" in line:
+                cand = line.split(":")[-1].strip()
+                if cand and cand != "":
+                    gateway = cand
+                    break
+    except Exception:
+        pass
+
+    results["gateway_detected"] = gateway
+    results["tests"].append(_ping("8.8.8.8"))
+    results["tests"].append(_ping("1.1.1.1"))
+    if gateway:
+        results["tests"].append(_ping(gateway))
+
+    try:
+        dns = subprocess.run(["nslookup", "google.com"], capture_output=True, text=True, timeout=COMMAND_TIMEOUT_SECONDS)
+        results["dns_ok"] = dns.returncode == 0
+        results["dns_output"] = (dns.stdout or "")[:400]
+    except Exception as exc:
+        results["dns_ok"] = False
+        results["dns_error"] = str(exc)
+
+    results["online"] = any(t.get("ok") for t in results["tests"] if t.get("target") in ("8.8.8.8", "1.1.1.1"))
+    return json.dumps(results, ensure_ascii=False)
+
+
+def network_fix() -> str:
+    """Corrige problemas de rede (DANGEROUS, exige confirmação explícita por etapa)."""
+    if platform.system() != "Windows":
+        return json.dumps({"error": "Correção disponível apenas no Windows."}, ensure_ascii=False)
+
+    steps = [
+        ("liberar endereço IP (ipconfig /release)", ["ipconfig", "/release"]),
+        ("renovar endereço IP (ipconfig /renew)", ["ipconfig", "/renew"]),
+        ("limpar cache DNS (ipconfig /flushdns)", ["ipconfig", "/flushdns"]),
+        ("registrar DNS (ipconfig /registerdns)", ["ipconfig", "/registerdns"]),
+    ]
+    executed: list[dict] = []
+    for description, cmd in steps:
+        if not confirm_action(f"rede: {description}", risk=DANGEROUS):
+            executed.append({"step": description, "skipped": True})
+            continue
+        try:
+            proc = subprocess.run(cmd, capture_output=True, text=True, timeout=COMMAND_TIMEOUT_SECONDS)
+            executed.append(
+                {
+                    "step": description,
+                    "ok": proc.returncode == 0,
+                    "stdout": (proc.stdout or "")[:300],
+                    "stderr": (proc.stderr or "")[:300],
+                }
+            )
+        except Exception as exc:
+            executed.append({"step": description, "ok": False, "error": str(exc)})
+    return json.dumps({"steps": executed}, ensure_ascii=False)
+
+
+def network_autorepair() -> str:
+    """Diagnostica e sugere/efetua reparos de rede com confirmação (DANGEROUS)."""
+    diag_raw = network_diagnostics()
+    diag = json.loads(diag_raw)
+    if diag.get("online"):
+        return json.dumps(
+            {"diagnostics": diag, "action": "sem_mudancas", "message": "Conectividade OK."},
+            ensure_ascii=False,
+        )
+    fix_raw = network_fix()
+    return json.dumps({"diagnostics": diag, "fix": json.loads(fix_raw)}, ensure_ascii=False)
+
+
+def schedule_task(name: str, when: str, kind: str = "reminder", repeat: str = "once") -> str:
+    """Agenda uma tarefa futura (SAFE). when: 'HH:MM', 'in 30' ou ISO."""
+    from . import scheduler as sched
+
+    task = sched.schedule_task(name=name, when=when, kind=kind, repeat=repeat)
+    return json.dumps(task, ensure_ascii=False)
+
+
+def list_scheduled() -> str:
+    """Lista tarefas agendadas (SAFE)."""
+    from . import scheduler as sched
+
+    return json.dumps({"tasks": sched.list_scheduled()}, ensure_ascii=False)
+
+
+def cancel_task(task_id: str) -> str:
+    """Cancela uma tarefa agendada (SAFE)."""
+    from . import scheduler as sched
+
+    ok = sched.cancel_task(task_id)
+    return json.dumps({"task_id": task_id, "cancelled": ok}, ensure_ascii=False)
+
+
 ToolHandler = Callable[..., str]
 
 # Nome da ferramenta -> função. O risco define a confirmação no modo graduado.
@@ -604,6 +851,18 @@ TOOL_HANDLERS: dict[str, ToolHandler] = {
     "mcp_list_tools": mcp_list_tools,
     "mcp_call": mcp_call,
     "run_command": run_command,
+    "get_weather": get_weather,
+    "take_quick_note": take_quick_note,
+    "append_quick_note": append_quick_note,
+    "list_quick_notes": list_quick_notes,
+    "daily_briefing": daily_briefing,
+    "play_media": play_media,
+    "network_diagnostics": network_diagnostics,
+    "network_fix": network_fix,
+    "network_autorepair": network_autorepair,
+    "schedule_task": schedule_task,
+    "list_scheduled": list_scheduled,
+    "cancel_task": cancel_task,
 }
 
 TOOL_RISK: dict[str, str] = {
@@ -644,6 +903,18 @@ TOOL_RISK: dict[str, str] = {
     "mcp_list_tools": SAFE,
     "mcp_call": DANGEROUS,
     "run_command": DANGEROUS,
+    "get_weather": SAFE,
+    "take_quick_note": SAFE,
+    "append_quick_note": SAFE,
+    "list_quick_notes": SAFE,
+    "daily_briefing": SAFE,
+    "play_media": SAFE,
+    "network_diagnostics": SAFE,
+    "network_fix": DANGEROUS,
+    "network_autorepair": DANGEROUS,
+    "schedule_task": SAFE,
+    "list_scheduled": SAFE,
+    "cancel_task": SAFE,
 }
 
 

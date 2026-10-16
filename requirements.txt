@@ -19,3 +19,6 @@ pycaw; sys_platform == "win32"
 mcp
 fastapi
 uvicorn[standard]
+
+# Opcional: interface compacta (Tkinter) com ícone de bandeja.
+pystray
