@@ -7,6 +7,7 @@ import httpx
 from google.genai import types
 
 from jarvis import providers
+from jarvis.failover import Target
 
 
 def _fake_response(payload: dict) -> SimpleNamespace:
@@ -198,6 +199,72 @@ class CreateChatTests(unittest.TestCase):
             chat = providers.create_chat("SYS", [], [])
         self.assertIsInstance(chat, providers.OpenAIChat)
         self.assertEqual(chat.model, "modelo-x")
+
+
+class CreateChatTargetTests(unittest.TestCase):
+    def test_zen_target_uses_zen_endpoint(self):
+        with (
+            patch.object(providers, "ZEN_BASE_URL", "https://zen.example/v1"),
+            patch.object(providers, "ZEN_API_KEY", "chave-zen"),
+            patch.object(providers, "ZEN_MODEL", "qwen3.6-plus-free"),
+        ):
+            chat = providers.create_chat("SYS", [], [], target=Target("zen"))
+        self.assertIsInstance(chat, providers.OpenAIChat)
+        self.assertEqual(chat.base_url, "https://zen.example/v1")
+        self.assertEqual(chat.api_key, "chave-zen")
+        self.assertEqual(chat.model, "qwen3.6-plus-free")
+
+    def test_zen_target_model_overrides_default(self):
+        with (
+            patch.object(providers, "ZEN_BASE_URL", "https://zen.example/v1"),
+            patch.object(providers, "ZEN_API_KEY", "k"),
+            patch.object(providers, "ZEN_MODEL", "qwen3.6-plus-free"),
+        ):
+            chat = providers.create_chat("SYS", [], [], target=Target("zen", "glm-5-free"))
+        self.assertEqual(chat.model, "glm-5-free")
+
+    def test_openai_target_uses_openai_settings(self):
+        with (
+            patch.object(providers, "OPENAI_BASE_URL", "http://localhost:11434/v1"),
+            patch.object(providers, "OPENAI_API_KEY", ""),
+            patch.object(providers, "OPENAI_MODEL", "llama3"),
+        ):
+            chat = providers.create_chat("SYS", [], [], target=Target("openai"))
+        self.assertEqual(chat.base_url, "http://localhost:11434/v1")
+        self.assertEqual(chat.api_key, "")
+        self.assertEqual(chat.model, "llama3")
+
+    def test_gemini_target_forwards_model_override(self):
+        with patch.object(
+            providers, "_create_gemini_chat", return_value="chat"
+        ) as factory:
+            providers.create_chat(
+                "SYS", [], [], target=Target("gemini", "gemini-2.5-flash-lite")
+            )
+        factory.assert_called_once_with("SYS", [], [], model="gemini-2.5-flash-lite")
+
+
+class OpenAITransportTargetTests(unittest.TestCase):
+    def test_post_uses_instance_credentials(self):
+        posted = []
+
+        def fake_post(url, headers=None, json=None, timeout=None):
+            posted.append((url, headers))
+            return _text_response("ok")
+
+        with patch.object(providers.httpx, "post", side_effect=fake_post):
+            chat = providers.OpenAIChat(
+                system_instruction="",
+                tools=[],
+                history=[],
+                base_url="https://zen.example/v1/",
+                api_key="k-zen",
+            )
+            chat.send_message([types.Part.from_text(text="oi")])
+
+        url, headers = posted[0]
+        self.assertEqual(url, "https://zen.example/v1/chat/completions")
+        self.assertEqual(headers["Authorization"], "Bearer k-zen")
 
 
 if __name__ == "__main__":

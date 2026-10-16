@@ -5,7 +5,8 @@ from pathlib import Path
 from types import SimpleNamespace
 from unittest.mock import patch
 
-from jarvis import brain, hands, memory
+from jarvis import brain, config, failover, hands, memory
+from jarvis.providers import ProviderError
 
 
 class FakeChat:
@@ -16,6 +17,16 @@ class FakeChat:
     def send_message(self, message):
         self.messages.append(message)
         return next(self.responses)
+
+
+class QuotaChat:
+    """Chat que sempre falha com um erro (simula provedor esgotado)."""
+
+    def __init__(self, error):
+        self.error = error
+
+    def send_message(self, _contents):
+        raise self.error
 
 
 class BrainTests(unittest.TestCase):
@@ -240,6 +251,164 @@ class BrainTests(unittest.TestCase):
         kwargs = create.call_args.kwargs
         self.assertEqual(kwargs["tools"], [])
         self.assertIn("MODO PLANO", kwargs["system_instruction"])
+
+
+class FailoverTurnTests(unittest.TestCase):
+    """O turno deve migrar para o próximo alvo quando um provedor estoura a cota."""
+
+    def setUp(self):
+        memory.reset_store()
+        self._tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(self._tmp.cleanup)
+        mem_patch = patch.object(
+            memory, "MEMORY_FILE", Path(self._tmp.name) / "memory.json"
+        )
+        mem_patch.start()
+        self.addCleanup(mem_patch.stop)
+        plan_patch = patch.object(brain.plan, "PLAN_MODE", False)
+        plan_patch.start()
+        self.addCleanup(plan_patch.stop)
+        state_patch = patch.object(
+            failover, "STATE_FILE", Path(self._tmp.name) / "provider_state.json"
+        )
+        state_patch.start()
+        self.addCleanup(state_patch.stop)
+        failover.reset_state()
+        self.addCleanup(failover.reset_state)
+
+    def _state(self):
+        if not failover.STATE_FILE.exists():
+            return {}
+        return json.loads(failover.STATE_FILE.read_text(encoding="utf-8"))
+
+    def test_quota_error_advances_to_next_target(self):
+        quota = ProviderError("Provedor retornou 429: RESOURCE_EXHAUSTED quota exceeded")
+
+        def build_chat(prompt="", target=None):
+            if target.kind == "zen":
+                return QuotaChat(quota)
+            return FakeChat(SimpleNamespace(function_calls=None, text="Resposta do Gemini"))
+
+        with (
+            patch.object(config, "PROVIDER_CHAIN", ("zen:qwen3.6-plus-free", "gemini")),
+            patch.object(brain, "_new_chat", side_effect=build_chat),
+        ):
+            result = brain.chat_with_vision("Oi")
+
+        self.assertEqual(result, "Resposta do Gemini")
+        self.assertIn("zen:qwen3.6-plus-free", self._state())
+
+    def test_plan_approval_is_not_requested_again_on_failover(self):
+        function_call = SimpleNamespace(
+            name="open_application", args={"application": "calculator"}
+        )
+        quota = ProviderError("Provedor retornou 429: quota exceeded")
+        pre_approved_seen = []
+
+        def build_chat(prompt="", target=None):
+            if target.kind == "zen":
+                return QuotaChat(quota)
+            return FakeChat(
+                SimpleNamespace(function_calls=[function_call], text=None),
+                SimpleNamespace(function_calls=None, text="Calculadora aberta."),
+            )
+
+        with (
+            patch.object(brain.plan, "PLAN_MODE", True),
+            patch.object(brain, "_draft_plan", return_value="1. Abrir a calculadora"),
+            patch.object(brain.security, "confirm_action", return_value=True) as confirm,
+            patch.object(config, "PROVIDER_CHAIN", ("zen", "gemini")),
+            patch.object(brain, "_new_chat", side_effect=build_chat),
+            patch.object(
+                brain,
+                "execute_tool",
+                side_effect=lambda *_: pre_approved_seen.append(
+                    brain.security.is_pre_approved()
+                )
+                or "ok",
+            ),
+        ):
+            result = brain.chat_with_vision("Abra a calculadora.")
+
+        self.assertEqual(result, "Calculadora aberta.")
+        confirm.assert_called_once()
+        self.assertEqual(pre_approved_seen, [True])
+
+    def test_mid_turn_quota_after_tools_is_not_retried(self):
+        quota = ProviderError("Provedor retornou 429: quota exceeded")
+
+        class MidTurnQuotaChat:
+            def __init__(self):
+                self.calls = 0
+
+            def send_message(self, _contents):
+                self.calls += 1
+                if self.calls == 1:
+                    return SimpleNamespace(
+                        function_calls=[
+                            SimpleNamespace(name="get_datetime", args={})
+                        ],
+                        text=None,
+                    )
+                raise quota
+
+        with (
+            patch.object(config, "PROVIDER_CHAIN", ("zen", "gemini")),
+            patch.object(
+                brain, "_new_chat", side_effect=lambda prompt="", target=None: MidTurnQuotaChat()
+            ),
+            patch.object(brain, "execute_tool", return_value="10:00") as run_tool,
+        ):
+            with self.assertRaises(ProviderError):
+                brain.chat_with_vision("Que horas são?")
+
+        # A ferramenta rodou uma única vez (o turno não foi repetido).
+        self.assertEqual(run_tool.call_count, 1)
+        self.assertIn("zen", self._state())
+
+    def test_non_quota_error_is_not_hidden_by_failover(self):
+        boom = RuntimeError("bug de verdade")
+
+        with (
+            patch.object(config, "PROVIDER_CHAIN", ("zen", "gemini")),
+            patch.object(brain, "_new_chat", side_effect=lambda prompt="", target=None: QuotaChat(boom)),
+        ):
+            with self.assertRaises(RuntimeError) as ctx:
+                brain.chat_with_vision("Oi")
+
+        self.assertIn("bug de verdade", str(ctx.exception))
+        self.assertEqual(self._state(), {})
+
+    def test_all_targets_exhausted_gives_friendly_message(self):
+        quota = ProviderError("Provedor retornou 429: quota exceeded")
+
+        with (
+            patch.object(config, "PROVIDER_CHAIN", ("zen", "gemini")),
+            patch.object(brain, "_new_chat", side_effect=lambda prompt="", target=None: QuotaChat(quota)),
+        ):
+            with self.assertRaises(RuntimeError) as ctx:
+                brain.chat_with_vision("Oi")
+
+        message = str(ctx.exception)
+        self.assertIn("Tente novamente", message)
+        self.assertNotIn("429", message)
+
+    def test_successful_turn_recovers_exhausted_target(self):
+        """Se um alvo esgotado volta a responder, ele é liberado na hora."""
+        with patch.object(config, "PROVIDER_CHAIN", ("zen",)):
+            failover.mark_exhausted(failover.Target("zen"), seconds=3600)
+            self.assertEqual(self._state().get("zen", 0) > 0, True)
+            with patch.object(
+                brain,
+                "_new_chat",
+                side_effect=lambda prompt="", target=None: FakeChat(
+                    SimpleNamespace(function_calls=None, text="ok")
+                ),
+            ):
+                result = brain.chat_with_vision("Oi")
+
+        self.assertEqual(result, "ok")
+        self.assertNotIn("zen", self._state())
 
 
 if __name__ == "__main__":

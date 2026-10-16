@@ -1,3 +1,4 @@
+import json
 import os
 import re
 from pathlib import Path
@@ -175,13 +176,52 @@ MCP_TIMEOUT_SECONDS = _read_int("JARVIS_MCP_TIMEOUT", 30)
 
 # Provedores de LLM. "gemini" (padrão) usa o Google GenAI; "openai" fala com
 # qualquer endpoint compatível com a API da OpenAI (OpenAI, Ollama, LM Studio,
-# OpenRouter, Groq...).
-PROVIDER = _read_choice("JARVIS_PROVIDER", "gemini", {"gemini", "openai"})
+# OpenRouter, Groq...); "zen" usa as LLMs gratuitas do console OpenCode.
+PROVIDER = _read_choice("JARVIS_PROVIDER", "gemini", {"gemini", "openai", "zen"})
 OPENAI_BASE_URL = os.getenv(
     "JARVIS_OPENAI_BASE_URL", "https://api.openai.com/v1"
 ).strip().rstrip("/")
 OPENAI_API_KEY = os.getenv("JARVIS_OPENAI_API_KEY", "").strip()
 OPENAI_MODEL = os.getenv("JARVIS_OPENAI_MODEL", "gpt-4o-mini").strip()
+
+
+def _read_opencode_key() -> str:
+    """Lê a chave do console OpenCode (Zen) da instalação local, se existir."""
+    for path in (
+        Path.home() / ".local" / "share" / "opencode" / "auth.json",
+        Path.home() / ".config" / "opencode" / "auth.json",
+    ):
+        try:
+            data = json.loads(path.read_text(encoding="utf-8"))
+            key = (data.get("opencode") or {}).get("key")
+        except (OSError, ValueError):
+            continue
+        if isinstance(key, str) and key.strip():
+            return key.strip()
+    return ""
+
+
+# Zen (OpenCode) — LLMs gratuitas. A chave vem de JARVIS_ZEN_API_KEY, depois de
+# OPENCODE_API_KEY e, por fim, da própria instalação do OpenCode (auth.json).
+ZEN_BASE_URL = os.getenv(
+    "JARVIS_ZEN_BASE_URL", "https://opencode.ai/inference/openai/v1"
+).strip().rstrip("/")
+ZEN_API_KEY = (
+    os.getenv("JARVIS_ZEN_API_KEY", "").strip()
+    or os.getenv("OPENCODE_API_KEY", "").strip()
+    or _read_opencode_key()
+)
+ZEN_MODEL = os.getenv("JARVIS_ZEN_MODEL", "qwen3.6-plus-free").strip()
+
+# Failover: cadeia de alvos na ordem de preferência (ex.: "zen,gemini").
+# Vazia = usa apenas JARVIS_PROVIDER (comportamento original, sem failover).
+PROVIDER_CHAIN = tuple(
+    item.strip()
+    for item in os.getenv("JARVIS_PROVIDER_CHAIN", "").split(",")
+    if item.strip()
+)
+# Segundos que um provedor fica fora da cadeia após um erro de cota (padrão: 6h).
+FAILOVER_COOLDOWN = _read_int("JARVIS_FAILOVER_COOLDOWN", 21_600, 60)
 
 # Interface e comportamento
 UI_MODE = _read_choice("JARVIS_UI_MODE", "web", {"web", "compact"})
@@ -193,7 +233,12 @@ OPENWEATHER_API_KEY = os.getenv("OPENWEATHER_API_KEY", "").strip()
 
 
 def active_model_name() -> str:
-    """Nome do modelo do provedor ativo."""
-    if PROVIDER == "openai":
-        return OPENAI_MODEL
-    return MODEL_NAME
+    """Nome do modelo do primeiro alvo ativo (cadeia) ou do provedor atual."""
+    raw = PROVIDER_CHAIN[0] if PROVIDER_CHAIN else PROVIDER
+    kind, _, model = raw.partition(":")
+    model = model.strip()
+    if kind == "zen":
+        return model or ZEN_MODEL
+    if kind == "openai":
+        return model or OPENAI_MODEL
+    return model or MODEL_NAME

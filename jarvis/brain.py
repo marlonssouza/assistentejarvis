@@ -5,7 +5,7 @@ from pathlib import Path
 from google.genai import types
 
 from . import memory
-from . import persona, plan, policies, providers, security
+from . import failover, persona, plan, policies, providers, security
 from .config import (
     HISTORY_MAX_MESSAGES,
     MAX_TOOL_CALLS_PER_TURN,
@@ -900,15 +900,16 @@ def build_system_instruction(prompt: str = "") -> str:
     return "\n\n".join(blocks)
 
 
-def _new_chat(prompt: str = ""):
+def _new_chat(prompt: str = "", target=None):
     return providers.create_chat(
         system_instruction=build_system_instruction(prompt),
         tools=TOOL_DECLARATIONS,
         history=list(_text_history),
+        target=target,
     )
 
 
-def _draft_plan(prompt: str, image_path: str | None = None) -> str:
+def _draft_plan(prompt: str, image_path: str | None = None, target=None) -> str:
     """Faz uma passada de planejamento (sem ferramentas) e devolve o plano.
 
     O plano é apenas uma descrição em texto: nenhuma ação é executada nesta
@@ -925,6 +926,7 @@ def _draft_plan(prompt: str, image_path: str | None = None) -> str:
         system_instruction=build_system_instruction(prompt) + plan.PLAN_SUFFIX,
         tools=[],
         history=list(_text_history),
+        target=target,
     )
     response = chat.send_message(contents)
     try:
@@ -1001,16 +1003,96 @@ def _read_text(response) -> str:
     return text
 
 
+def _run_turn(target, prompt: str, contents, approved_plan: bool) -> str:
+    """Executa um turno completo em ``target`` e devolve a resposta final.
+
+    Erros de cota ocorridos **antes** de qualquer ferramenta rodar viram
+    ``RetriableProviderError``: o failover repete o turno em outro provedor
+    sem risco de duplicar efeitos colaterais. Depois de haver efeitos, o erro
+    sobe como está (o alvo é marcado, mas o turno não é repetido).
+    """
+    chat = _new_chat(prompt, target)
+    effects_started = False
+    try:
+        # Se o plano foi aprovado, as ações deste turno não pedem confirmação de novo.
+        with security.pre_approved(approved_plan):
+            response = chat.send_message(contents)
+            for _ in range(MAX_TOOL_CALLS_PER_TURN):
+                function_calls = response.function_calls or []
+                if not function_calls:
+                    break
+
+                effects_started = True
+                function_results = []
+                captured_images: list[str] = []
+                for function_call in function_calls:
+                    if not isinstance(function_call.args, dict):
+                        raise RuntimeError(
+                            f"Argumentos inválidos para a ferramenta {function_call.name}."
+                        )
+                    try:
+                        result = execute_tool(function_call.name, function_call.args)
+                        function_response = {"result": result}
+                        if function_call.name == "capture_screen":
+                            path = _parse_capture_path(result)
+                            if path is not None:
+                                captured_images.append(path)
+                    except (OSError, RuntimeError, TypeError, ValueError) as exc:
+                        logger.exception(
+                            "A ferramenta %s não conseguiu concluir a ação.",
+                            function_call.name,
+                        )
+                        function_response = {"error": str(exc)}
+
+                    function_results.append(
+                        types.Part.from_function_response(
+                            name=function_call.name,
+                            response=function_response,
+                        )
+                    )
+                response = chat.send_message(function_results)
+
+                if captured_images:
+                    response = chat.send_message(
+                        _build_capture_message(captured_images)
+                    )
+            else:
+                if response.function_calls:
+                    raise RuntimeError(
+                        f"O Gemini excedeu o limite de {MAX_TOOL_CALLS_PER_TURN} chamadas "
+                        "de ferramentas nesta solicitação."
+                    )
+    except Exception as exc:  # noqa: BLE001 - classificado pelo failover
+        if not effects_started and failover.is_quota_error(exc):
+            raise failover.RetriableProviderError(target, exc) from exc
+        raise
+    return _read_text(response)
+
+
+def _draft_plan_with_failover(prompt: str, image_path: str | None) -> str:
+    """Rascunha o plano tentando os alvos saudáveis da cadeia (best effort)."""
+    for target in failover.candidates():
+        try:
+            return _draft_plan(prompt, image_path, target)
+        except Exception as exc:  # noqa: BLE001 - planejar nunca derruba o turno
+            if failover.is_quota_error(exc):
+                failover.mark_exhausted(target, error=exc)
+                logger.warning(
+                    "Provedor %s indisponível durante o planejamento; tentando o próximo.",
+                    target,
+                )
+                continue
+            logger.exception("Falha ao rascunhar o plano; seguindo sem modo plano.")
+            return ""
+    return ""
+
+
 def chat_with_vision(prompt: str, image_path: str | None = None) -> str:
     _ensure_history_loaded()
 
     approved_plan = False
     if plan.is_enabled():
-        try:
-            draft = _draft_plan(prompt, image_path)
-        except Exception:  # noqa: BLE001 - planejar nunca deve derrubar o turno
-            logger.exception("Falha ao rascunhar o plano; seguindo sem modo plano.")
-            draft = ""
+        draft = _draft_plan_with_failover(prompt, image_path)
         if draft and not plan.is_no_action(draft):
             if not security.confirm_action(
                 "executar este plano:\n" + plan.format_plan(draft),
@@ -1028,56 +1110,34 @@ def chat_with_vision(prompt: str, image_path: str | None = None) -> str:
             types.Part.from_bytes(data=image_bytes, mime_type="image/png")
         )
 
-    chat = _new_chat(prompt)
-    # Se o plano foi aprovado, as ações deste turno não pedem confirmação de novo.
-    with security.pre_approved(approved_plan):
-        response = chat.send_message(contents)
-        for _ in range(MAX_TOOL_CALLS_PER_TURN):
-            function_calls = response.function_calls or []
-            if not function_calls:
-                break
+    last_error: BaseException | None = None
+    for target in failover.candidates():
+        try:
+            answer = _run_turn(target, prompt, contents, approved_plan)
+        except failover.RetriableProviderError as exc:
+            # Cota estourada antes de qualquer efeito: tenta o próximo alvo.
+            last_error = exc.original
+            failover.mark_exhausted(target, error=exc.original)
+            logger.warning(
+                "Provedor %s esgotado; tentando o próximo alvo da cadeia.", target
+            )
+            continue
+        except Exception as exc:  # noqa: BLE001
+            if failover.is_quota_error(exc):
+                # Já houve efeitos neste turno: não repetimos, mas marcamos o
+                # alvo para que os próximos turnos já partam para o seguinte.
+                failover.mark_exhausted(target, error=exc)
+            raise
+        failover.recover(target)
+        if last_error is not None:
+            logger.info(
+                "Failover concluído: %s respondeu após esgotar outro(s) alvo(s).",
+                target,
+            )
+        _record_turn(prompt, answer)
+        return answer
 
-            function_results = []
-            captured_images: list[str] = []
-            for function_call in function_calls:
-                if not isinstance(function_call.args, dict):
-                    raise RuntimeError(
-                        f"Argumentos inválidos para a ferramenta {function_call.name}."
-                    )
-                try:
-                    result = execute_tool(function_call.name, function_call.args)
-                    function_response = {"result": result}
-                    if function_call.name == "capture_screen":
-                        path = _parse_capture_path(result)
-                        if path is not None:
-                            captured_images.append(path)
-                except (OSError, RuntimeError, TypeError, ValueError) as exc:
-                    logger.exception(
-                        "A ferramenta %s não conseguiu concluir a ação.",
-                        function_call.name,
-                    )
-                    function_response = {"error": str(exc)}
-
-                function_results.append(
-                    types.Part.from_function_response(
-                        name=function_call.name,
-                        response=function_response,
-                    )
-                )
-            response = chat.send_message(function_results)
-
-            if captured_images:
-                response = chat.send_message(_build_capture_message(captured_images))
-        else:
-            if response.function_calls:
-                raise RuntimeError(
-                    f"O Gemini excedeu o limite de {MAX_TOOL_CALLS_PER_TURN} chamadas "
-                    "de ferramentas nesta solicitação."
-                )
-
-    answer = _read_text(response)
-    _record_turn(prompt, answer)
-    return answer
+    raise RuntimeError(failover.exhausted_message()) from last_error
 
 
 def reset_conversation() -> None:

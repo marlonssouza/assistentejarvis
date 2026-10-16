@@ -26,6 +26,9 @@ from .config import (
     OPENAI_BASE_URL,
     OPENAI_MODEL,
     PROVIDER,
+    ZEN_API_KEY,
+    ZEN_BASE_URL,
+    ZEN_MODEL,
     get_gemini_api_key,
 )
 
@@ -65,7 +68,7 @@ def _get_gemini_client():
     return _gemini_client
 
 
-def _create_gemini_chat(system_instruction: str, tools, history):
+def _create_gemini_chat(system_instruction: str, tools, history, model: str | None = None):
     from google.genai import types
 
     config = types.GenerateContentConfig(
@@ -73,7 +76,7 @@ def _create_gemini_chat(system_instruction: str, tools, history):
         tools=tools,
     )
     return _get_gemini_client().chats.create(
-        model=MODEL_NAME,
+        model=model or MODEL_NAME,
         config=config,
         history=list(history),
     )
@@ -179,12 +182,27 @@ def _parts_to_message(parts) -> dict:
 class OpenAIChat:
     """Chat compatível com a interface usada pelo ``brain``."""
 
-    def __init__(self, system_instruction: str, tools, history, model: str | None = None) -> None:
-        if not OPENAI_API_KEY and "localhost" not in OPENAI_BASE_URL and "127.0.0.1" not in OPENAI_BASE_URL:
+    def __init__(
+        self,
+        system_instruction: str,
+        tools,
+        history,
+        model: str | None = None,
+        base_url: str | None = None,
+        api_key: str | None = None,
+    ) -> None:
+        self.base_url = (base_url if base_url is not None else OPENAI_BASE_URL).rstrip("/")
+        self.api_key = api_key if api_key is not None else OPENAI_API_KEY
+        if (
+            not self.api_key
+            and "localhost" not in self.base_url
+            and "127.0.0.1" not in self.base_url
+        ):
             # Muitos servidores locais não exigem chave; para provedores remotos
             # uma chave é necessária.
             logger.warning(
-                "JARVIS_OPENAI_API_KEY não está definida; o provedor pode recusar a requisição."
+                "Nenhuma chave de API definida para %s; o provedor pode recusar a requisição.",
+                self.base_url,
             )
         self.model = model or OPENAI_MODEL
         self.tools = _tools_to_openai(tools)
@@ -197,9 +215,9 @@ class OpenAIChat:
     # ------------------------------------------------------------- transporte
     def _post(self, payload: dict) -> dict:
         headers = {"Content-Type": "application/json"}
-        if OPENAI_API_KEY:
-            headers["Authorization"] = f"Bearer {OPENAI_API_KEY}"
-        url = f"{OPENAI_BASE_URL}/chat/completions"
+        if self.api_key:
+            headers["Authorization"] = f"Bearer {self.api_key}"
+        url = f"{self.base_url}/chat/completions"
         try:
             response = httpx.post(url, headers=headers, json=payload, timeout=_REQUEST_TIMEOUT)
             response.raise_for_status()
@@ -285,8 +303,28 @@ class OpenAIChat:
         return SimpleNamespace(text=message.get("content"), function_calls=function_calls)
 
 
-def create_chat(system_instruction: str, tools, history):
-    """Cria um chat no provedor ativo, com a mesma interface do Gemini."""
-    if PROVIDER == "openai":
-        return OpenAIChat(system_instruction=system_instruction, tools=tools, history=history)
+def create_chat(system_instruction: str, tools, history, target=None):
+    """Cria um chat no alvo indicado (ou no provedor ativo), com a interface do Gemini."""
+    kind = getattr(target, "kind", None) or PROVIDER
+    model = getattr(target, "model", None)
+    if kind == "zen":
+        return OpenAIChat(
+            system_instruction=system_instruction,
+            tools=tools,
+            history=history,
+            model=model or ZEN_MODEL,
+            base_url=ZEN_BASE_URL,
+            api_key=ZEN_API_KEY,
+        )
+    if kind == "openai":
+        return OpenAIChat(
+            system_instruction=system_instruction,
+            tools=tools,
+            history=history,
+            model=model,
+            base_url=OPENAI_BASE_URL,
+            api_key=OPENAI_API_KEY,
+        )
+    if model:
+        return _create_gemini_chat(system_instruction, tools, history, model=model)
     return _create_gemini_chat(system_instruction, tools, history)

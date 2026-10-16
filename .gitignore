@@ -4,7 +4,7 @@ venv/
 ENV/
 env/
 
-# ConfiguraÃ§Ãµes locais e segredos
+# Configurações locais e segredos
 .env
 .env.local
 .env.*.local
@@ -32,7 +32,7 @@ screen.png
 *.tmp.mp3
 *.tmp.png
 
-# Build e DistribuiÃ§Ã£o
+# Build e Distribuição
 build/
 dist/
 *.egg-info/
