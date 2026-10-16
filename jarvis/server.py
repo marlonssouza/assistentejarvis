@@ -46,7 +46,7 @@ def is_authorized(token: str | None) -> bool:
 
 @app.get("/")
 async def index() -> FileResponse:
-    return FileResponse(_WEBUI_DIR / "index.html")
+    return FileResponse(_WEBUI_DIR / "index.html", media_type="text/html; charset=utf-8")
 
 
 @app.get("/api/skills")
