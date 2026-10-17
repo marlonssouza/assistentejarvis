@@ -15,7 +15,7 @@ import pyautogui
 
 from . import apps, events, memory, security
 from . import browser as browser_auto
-from . import mcp, policies, system
+from . import mcp, policies, system, github_mcp
 from .mail import list_emails, read_email
 from .config import (
     ALLOWED_FILES_DIR,
@@ -253,6 +253,11 @@ def list_skills() -> str:
         },
         ensure_ascii=False,
     )
+
+
+def github_get_file_contents(owner: str, repo: str, path: str, ref: str = "") -> str:
+    """Consulta arquivo/pasta GitHub, somente leitura, credencial fora do modelo."""
+    return json.dumps(github_mcp.get_file_contents(owner, repo, path, ref), ensure_ascii=False)
 
 
 def mcp_list_tools(server: str = "") -> str:
@@ -849,6 +854,7 @@ TOOL_HANDLERS: dict[str, ToolHandler] = {
     "list_reminders": list_reminders,
     "list_skills": list_skills,
     "mcp_list_tools": mcp_list_tools,
+    "github_get_file_contents": github_get_file_contents,
     "mcp_call": mcp_call,
     "run_command": run_command,
     "get_weather": get_weather,
@@ -901,6 +907,7 @@ TOOL_RISK: dict[str, str] = {
     "list_reminders": SAFE,
     "list_skills": SAFE,
     "mcp_list_tools": SAFE,
+    "github_get_file_contents": SAFE,
     "mcp_call": DANGEROUS,
     "run_command": DANGEROUS,
     "get_weather": SAFE,

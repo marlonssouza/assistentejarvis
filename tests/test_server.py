@@ -56,6 +56,28 @@ class HttpEndpointsTests(unittest.TestCase):
 
 
 class WebSocketTests(unittest.TestCase):
+    def test_server_launchers_enable_websocket_ping_validation(self):
+        from jarvis import compact_app
+
+        with (
+            patch.object(server, "validate_provider_configuration"),
+            patch.object(server, "start_background_services"),
+            patch.object(server.uvicorn, "run") as run_server,
+        ):
+            server.run(open_browser=False)
+            compact_app._start_server()
+
+        self.assertEqual(run_server.call_count, 2)
+        for call in run_server.call_args_list:
+            self.assertEqual(
+                call.kwargs["ws_ping_interval"],
+                server._WS_PING_INTERVAL,
+            )
+            self.assertEqual(
+                call.kwargs["ws_ping_timeout"],
+                server._WS_PING_TIMEOUT,
+            )
+
     def test_receives_ready_with_skills(self):
         with TestClient(server.app) as client:
             with client.websocket_connect("/ws") as ws:
@@ -117,7 +139,7 @@ class WebSocketTests(unittest.TestCase):
         com um pedido em andamento (o loop precisa continuar lendo o /ws)."""
         from jarvis import security
 
-        def fake_chat(text, image=None):
+        def fake_chat(text, image=None, on_sentence=None):
             ok = security.confirm_action("abrir calculadora", risk=security.DANGEROUS)
             return "executado=%s" % ok
 
@@ -152,7 +174,7 @@ class WebSocketTests(unittest.TestCase):
         self.assertIn("executado=True", assistant["text"])
 
     def test_quota_error_is_reported_in_friendly_way(self):
-        def fake_chat(text, image=None):
+        def fake_chat(text, image=None, on_sentence=None):
             raise Exception(
                 "429 RESOURCE_EXHAUSTED. quota exceeded for gemini-2.5-flash"
             )

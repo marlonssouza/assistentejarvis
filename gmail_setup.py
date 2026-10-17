@@ -12,11 +12,14 @@ O token fica em ``~/.jarvis/token.json`` e é reutilizado nas próximas vezes.
 import logging
 
 from jarvis.config import GMAIL_CREDENTIALS, GMAIL_TOKEN
+from jarvis.logging_config import configure_logging
 from jarvis.mail import authenticate
+
+logger = logging.getLogger(__name__)
 
 
 def main() -> None:
-    logging.basicConfig(level=logging.INFO)
+    configure_logging()
     print("Configuracao do Gmail para o J.A.R.V.I.S.")
     print(f"  Credenciais: {GMAIL_CREDENTIALS}")
     print(f"  Token:       {GMAIL_TOKEN}")
@@ -30,6 +33,7 @@ def main() -> None:
     try:
         authenticate()
     except Exception as exc:  # noqa: BLE001
+        logger.exception("Falha na autenticacao do Gmail.")
         print(f"\n[!] Falha na autenticacao: {exc}")
         return
     print("\n[ok] Gmail autorizado. O Jarvis ja pode ler seus e-mails.")

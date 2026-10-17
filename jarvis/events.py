@@ -5,6 +5,8 @@ O terminal, a interface web e os testes podem se inscrever para receber eventos
 núcleo (``brain``/``hands``/``security``) precise conhecê-los.
 """
 
+import contextlib
+import contextvars
 import logging
 import threading
 from typing import Callable
@@ -12,6 +14,16 @@ from typing import Callable
 logger = logging.getLogger(__name__)
 
 Listener = Callable[[dict], None]
+
+_scoped_listener = contextvars.ContextVar("jarvis_event_listener", default=None)
+
+@contextlib.contextmanager
+def scoped_listener(listener):
+    token = _scoped_listener.set(listener)
+    try:
+        yield
+    finally:
+        _scoped_listener.reset(token)
 
 _listeners: list[Listener] = []
 _lock = threading.Lock()
@@ -38,6 +50,10 @@ def clear() -> None:
 
 def emit(event: dict) -> None:
     """Entrega um evento a todos os inscritos, isolando falhas individuais."""
+    scoped = _scoped_listener.get()
+    if scoped is not None:
+        scoped(event)
+        return
     with _lock:
         listeners = list(_listeners)
     for listener in listeners:

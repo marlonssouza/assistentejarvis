@@ -3,7 +3,7 @@
 import html
 import logging
 from html.parser import HTMLParser
-from urllib.parse import urlparse
+from urllib.parse import urlparse, parse_qs
 
 import httpx
 from google import genai
@@ -142,7 +142,7 @@ def _extract_sources(response) -> list[str]:
     return sources
 
 
-def web_search(query: str) -> str:
+def _gemini_web_search(query: str) -> str:
     """Pesquisa na web via Gemini com grounding do Google e devolve um resumo."""
     if not query or not query.strip():
         raise ValueError("A consulta de pesquisa não pode ser vazia.")
@@ -167,3 +167,56 @@ def web_search(query: str) -> str:
     if sources:
         return f"{answer}\n\nFontes:\n" + "\n".join(sources)
     return answer
+
+
+class _SearchResults(HTMLParser):
+    def __init__(self):
+        super().__init__(convert_charrefs=True)
+        self.results = []
+        self.current = None
+
+    def handle_starttag(self, tag, attrs):
+        attrs = dict(attrs)
+        if tag == "a" and "result__a" in attrs.get("class", "").split():
+            self.current = [attrs.get("href", ""), []]
+
+    def handle_data(self, data):
+        if self.current is not None:
+            self.current[1].append(data)
+
+    def handle_endtag(self, tag):
+        if tag == "a" and self.current is not None:
+            url, title = self.current
+            parsed = urlparse(url)
+            url = parse_qs(parsed.query).get("uddg", [url])[0]
+            if urlparse(url).scheme in {"http", "https"}:
+                self.results.append(("".join(title).strip(), url))
+            self.current = None
+
+
+def web_search(query: str) -> str:
+    """Pesquisa sem exigir Gemini; retorna fontes para o modelo resumir."""
+    if not isinstance(query, str) or not query.strip():
+        raise ValueError("A consulta de pesquisa não pode ser vazia.")
+    from . import failover
+    if failover.chain()[0].kind == "gemini":
+        try:
+            return _gemini_web_search(query)
+        except Exception:
+            logger.warning("Pesquisa Gemini indisponível; tentando pesquisa pública.")
+    try:
+        response = httpx.get(
+            "https://html.duckduckgo.com/html/", params={"q": query},
+            headers={"User-Agent": _USER_AGENT}, timeout=WEB_FETCH_TIMEOUT,
+            follow_redirects=True,
+        )
+        response.raise_for_status()
+        parser = _SearchResults()
+        parser.feed(response.text)
+        if parser.results:
+            return "Resultados da pesquisa (leia as fontes antes de afirmar detalhes):\n" + "\n".join(
+                f"- {title}: {url}" for title, url in parser.results[:8]
+            )
+    except httpx.HTTPError:
+        logger.warning("Pesquisa pública indisponível.")
+    return "A pesquisa não forneceu resultados legíveis ou exigiu verificação. Não invente resultados; tente novamente mais tarde."

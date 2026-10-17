@@ -264,3 +264,6 @@ __marimo__/
 
 # Streamlit
 .streamlit/secrets.toml
+
+# Cópias locais de configuração com segredos
+.env.before-*

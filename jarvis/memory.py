@@ -10,20 +10,39 @@ O formato antigo (``facts`` como lista de textos) continua sendo lido e migrado
 automaticamente.
 """
 
+import asyncio
 import hashlib
 import json
 import logging
+import os
+import tempfile
 import threading
 import uuid
+from functools import wraps
 from datetime import datetime
 from pathlib import Path
+from typing import Callable, Concatenate, ParamSpec, TypeVar
 
 from .config import HISTORY_MAX_MESSAGES, MEMORY_ENABLED, MEMORY_FILE
 from .textutil import jaccard, tokens as _tokens
 
 logger = logging.getLogger(__name__)
 
-_lock = threading.Lock()
+_lock = threading.RLock()
+_P = ParamSpec("_P")
+_R = TypeVar("_R")
+
+
+def _synchronized(
+    method: Callable[Concatenate["Memory", _P], _R],
+) -> Callable[Concatenate["Memory", _P], _R]:
+    @wraps(method)
+    def wrapper(self: "Memory", *args: _P.args, **kwargs: _P.kwargs) -> _R:
+        with _lock:
+            return method(self, *args, **kwargs)
+
+    return wrapper
+
 
 # Aspectos (categorias) de um fato, baseados no vocabulário do CORE.
 ASPECTS: tuple[str, ...] = (
@@ -94,7 +113,13 @@ class Memory:
     def __init__(self, path: Path, enabled: bool = True) -> None:
         self.path = path
         self.enabled = enabled
+        self._async_lock = asyncio.Lock()
         self._data = self._load()
+
+    async def run_async(self, operation: Callable[[], _R]) -> _R:
+        """Run a synchronous memory operation safely from an asyncio task."""
+        async with self._async_lock:
+            return await asyncio.to_thread(operation)
 
     @staticmethod
     def _empty() -> dict[str, list]:
@@ -134,6 +159,7 @@ class Memory:
             }
         return None
 
+    @_synchronized
     def _load(self) -> dict[str, list]:
         if not self.enabled or not self.path.exists():
             return self._empty()
@@ -157,32 +183,54 @@ class Memory:
             "facts": facts,
         }
 
+    @_synchronized
     def _save(self) -> None:
         if not self.enabled:
             return
+        temporary_path: str | None = None
         try:
             self.path.parent.mkdir(parents=True, exist_ok=True)
-            self.path.write_text(
-                json.dumps(self._data, ensure_ascii=False, indent=2),
-                encoding="utf-8",
+            file_descriptor, temporary_path = tempfile.mkstemp(
+                prefix=f".{self.path.name}.",
+                suffix=".tmp",
+                dir=self.path.parent,
             )
+            with os.fdopen(file_descriptor, "w", encoding="utf-8") as temporary_file:
+                json.dump(self._data, temporary_file, ensure_ascii=False, indent=2)
+                temporary_file.flush()
+                os.fsync(temporary_file.fileno())
+            os.replace(temporary_path, self.path)
+            temporary_path = None
         except OSError:
             logger.exception("Não foi possível salvar a memória.")
+        finally:
+            if temporary_path is not None:
+                try:
+                    os.unlink(temporary_path)
+                except OSError:
+                    logger.warning(
+                        "Não foi possível remover o arquivo temporário da memória: %s",
+                        temporary_path,
+                    )
 
     # ------------------------------------------------------------- conversa
+    @_synchronized
     def messages(self) -> list[dict[str, str]]:
         return [m for m in self._data["messages"] if isinstance(m, dict)]
 
+    @_synchronized
     def add_message(self, role: str, text: str) -> None:
         self._data["messages"].append({"role": role, "text": text})
         self._data["messages"] = self._data["messages"][-HISTORY_MAX_MESSAGES:]
         self._save()
 
+    @_synchronized
     def clear_messages(self) -> None:
         self._data["messages"] = []
         self._save()
 
     # ---------------------------------------------------------------- fatos
+    @_synchronized
     def records(self, include_superseded: bool = False) -> list[dict]:
         """Fatos estruturados (ativos por padrão)."""
         facts = self._data["facts"]
@@ -190,10 +238,12 @@ class Memory:
             return [dict(fact) for fact in facts]
         return [dict(fact) for fact in facts if not fact.get("superseded_by")]
 
+    @_synchronized
     def facts(self, include_superseded: bool = False) -> list[str]:
         """Textos dos fatos (compatível com a versão anterior)."""
         return [fact["text"] for fact in self.records(include_superseded)]
 
+    @_synchronized
     def _find_by_text(self, text: str) -> dict | None:
         normalized = text.strip().casefold()
         for fact in self._data["facts"]:
@@ -201,6 +251,7 @@ class Memory:
                 return fact
         return None
 
+    @_synchronized
     def _mark_superseded(self, old_id: str, new_id: str) -> bool:
         for fact in self._data["facts"]:
             if fact["id"] == old_id and not fact.get("superseded_by"):
@@ -209,6 +260,7 @@ class Memory:
                 return True
         return False
 
+    @_synchronized
     def add_fact(
         self,
         fact: str,
@@ -239,6 +291,7 @@ class Memory:
         self._save()
         return True
 
+    @_synchronized
     def supersede(self, old_id: str, new_text: str, aspect: str | None = None) -> bool:
         """Substitui um fato antigo por um novo, preservando o histórico."""
         if not isinstance(new_text, str) or not new_text.strip():
@@ -262,6 +315,7 @@ class Memory:
         self._save()
         return True
 
+    @_synchronized
     def remove_fact(self, fact_id: str) -> bool:
         before = len(self._data["facts"])
         self._data["facts"] = [
@@ -272,6 +326,7 @@ class Memory:
         self._save()
         return True
 
+    @_synchronized
     def search_facts(
         self,
         query: str = "",
@@ -297,6 +352,7 @@ class Memory:
         scored.sort(key=lambda pair: pair[0], reverse=True)
         return [record for _, record in scored[:limit]]
 
+    @_synchronized
     def clear_all(self) -> None:
         self._data = self._empty()
         self._save()

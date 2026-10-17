@@ -1,17 +1,25 @@
 ﻿# J.A.R.V.I.S. Multi-Plataforma (Windows e Linux)
 
-Assistente pessoal em Python com conversa usando Gemini, entrada e saída de voz,
+Assistente pessoal em Python com conversa local usando Ollama, entrada e saída de voz,
 análise opcional da tela e automações locais com confirmação por risco. Identifica
 automaticamente se você está rodando no Windows ou no Linux.
 
 ## Requisitos
 
-- Python 3.10 ou superior.
-- Uma chave da Gemini API.
-- Para usar o microfone, PyAudio e um microfone disponível. A dependência
-  `SpeechRecognition[audio]` instala o suporte de áudio quando disponível; no
-  Linux, pode ser necessário instalar previamente os pacotes de desenvolvimento
-  do PortAudio pela distribuição.
+- Python 3.11 ou superior.
+- Ollama em execução, com Qwen 2.5 7B e/ou Llama 3.1 8B instalados.
+- Chave Gemini somente se optar pelas funcionalidades específicas desse provedor.
+- Para usar o microfone, PyAudio e um microfone disponível; no Linux, pode ser
+  necessário instalar previamente os pacotes de desenvolvimento do PortAudio.
+- A captura pelo microfone local filtra ruído com Silero VAD via ONNX Runtime:
+  somente blocos com probabilidade de fala maior que `0.5` são mantidos. O modelo
+  ONNX é baixado do repositório oficial na primeira captura e armazenado em
+  `~/.jarvis/models`; depois disso, a detecção funciona localmente.
+- O reconhecimento de fala usa `faster-whisper` localmente, com o modelo `tiny`
+  por padrão (`base` também é aceito). O primeiro uso baixa os pesos do modelo;
+  depois disso, a transcrição é executada localmente, sem enviar áudio a serviços
+  de reconhecimento. Configure `JARVIS_STT_MODEL_DIR` para escolher o diretório
+  de cache dos modelos.
 - Para ouvir as respostas e falar, `ffplay` (recomendado), `mpg123` ou `mpv`.
   Sem um destes, no Windows o Jarvis usa o player padrão do sistema (sem
   bloquear) e no Linux a fala fica indisponível.
@@ -45,16 +53,22 @@ Para usar **ferramentas externas via MCP** (ferramentas `mcp_*`), o pacote `mcp`
 Jarvis continua funcionando normalmente, apenas as ferramentas MCP avisam que
 precisam ser instaladas.
 
-Para usar **outro provedor de LLM** (OpenAI/Ollama/LM Studio), defina
-`JARVIS_PROVIDER=openai` e as variáveis `JARVIS_OPENAI_*` (veja `.env.example`).
-O padrão continua sendo o Gemini.
+O padrão é o Ollama local com Qwen e Llama já instalados.
+Não é necessária chave de API para conversar. Gemini é opcional para Live/visão.
 
-Copie `.env.example` para `.env` e configure `GEMINI_API_KEY`:
+Copie `.env.example` para `.env` e confirme os nomes dos modelos locais:
 
 ```dotenv
-GEMINI_API_KEY=sua-chave-da-gemini
-JARVIS_SCREEN_CAPTURE_ENABLED=true
+JARVIS_PROVIDER=ollama
+JARVIS_OLLAMA_MODEL=qwen2.5:7b-instruct-q4_K_M
+JARVIS_PROVIDER_CHAIN=ollama:qwen2.5:7b-instruct-q4_K_M,ollama:llama3.1:8b
 ```
+
+Os logs da aplicação e os stack traces de erros são exibidos no console e
+gravados em `~/.jarvis/logs/jarvis.log`, com rotação automática (até cinco
+arquivos de backup). Para alterar o destino ou o nível, configure
+`JARVIS_LOG_FILE` e `JARVIS_LOG_LEVEL` (`DEBUG`, `INFO`, `WARNING`, `ERROR` ou
+`CRITICAL`) no `.env`.
 
 Execute o assistente:
 
@@ -64,16 +78,28 @@ python main.py
 
 ## Como conversar
 
-- **Modo voz contínuo (padrão):** o Jarvis fica ouvindo; diga a palavra de
-  ativação (`JARVIS_WAKE_WORDS`, padrão `jarvis`, ou só "Jarvis") e em seguida o
-  pedido. Se o microfone não estiver disponível, ele cai automaticamente para a
-  entrada por texto. Desative com `JARVIS_WAKE_ENABLED=false`.
+- **Persona:** o assistente responde em português brasileiro com formalidade
+  britânica natural, cortesia e tratamento por “Senhor”; mantém a fala concisa e
+  pode usar humor seco sutil sem deixar de ser respeitoso ou preciso.
+- **Palavra de ativação:** com `JARVIS_WAKE_ENABLED=true` (padrão), os modos de
+  voz do terminal e do navegador só encaminham o pedido ao assistente quando a
+  transcrição local começa com uma palavra de `JARVIS_WAKE_WORDS` (padrão:
+  `jarvis`, `ei jarvis`, `hey jarvis`). Diga, por exemplo, “Jarvis, abra a
+  calculadora”; palavras ditas no meio da frase não ativam o assistente. A
+  transcrição local é necessária para verificar o prefixo; sem ele, o texto não
+  é enviado ao modelo nem interrompe uma resposta em andamento. Uma palavra de
+  ativação válida interrompe a resposta anterior e encaminha apenas o pedido.
+  O microfone indisponível leva à entrada por texto no terminal. Desative a
+  exigência com `JARVIS_WAKE_ENABLED=false`.
 - **Modo texto:** com `JARVIS_WAKE_ENABLED=false`, digite o pedido e pressione
   Enter. Deixar a linha em branco faz o Jarvis escutar uma fala curta.
 - **Voz natural:** as respostas usam vozes neurais (`edge-tts`, grátis e naturais
   em pt-BR). Escolha a voz em `JARVIS_TTS_VOICE` (`pt-BR-AntonioNeural` é o padrão;
   também há `pt-BR-FranciscaNeural` e `pt-BR-ThalitaMultilingualNeural`) e a
   velocidade em `JARVIS_TTS_RATE`. Para voltar ao gTTS, use `JARVIS_TTS_BACKEND=gtts`.
+  Com o Ollama e a opção **Voz online** (ou no modo de terminal), a primeira frase
+  começa a ser sintetizada assim que chega a pontuação final, enquanto o modelo
+  ainda gera o restante. A voz do navegador continua lendo a resposta completa.
 - **Modo voz em tempo real (Live):** defina `JARVIS_LIVE_MODE=true` para falar
   naturalmente, com o modelo respondendo em áudio quase instantâneo (incluindo
   interrupção/barge-in). É experimental e opcional; se a sessão não puder iniciar,
@@ -304,65 +330,35 @@ pip install "jarvis-cross-platform[tray]"
 
 ## Provedores de LLM
 
-Por padrão o Jarvis usa o **Gemini** (`JARVIS_PROVIDER=gemini`). Para usar qualquer
-endpoint compatível com a API da OpenAI (OpenAI, Ollama, LM Studio, OpenRouter,
-Groq…), defina:
+Ollama local é o padrão. A aplicação usa `/api/chat` nativo, sem serviços intermediários.
 
 ```dotenv
-JARVIS_PROVIDER=openai
-JARVIS_OPENAI_BASE_URL=http://localhost:11434/v1
-JARVIS_OPENAI_API_KEY=
-JARVIS_OPENAI_MODEL=llama3.1
+JARVIS_PROVIDER=ollama
+JARVIS_OLLAMA_BASE_URL=http://127.0.0.1:11434
+JARVIS_OLLAMA_MODEL=qwen2.5:7b-instruct-q4_K_M
+JARVIS_PROVIDER_CHAIN=ollama:qwen2.5:7b-instruct-q4_K_M,ollama:llama3.1:8b
+JARVIS_OLLAMA_NUM_CTX=8192
+JARVIS_OLLAMA_MAX_TOKENS=384
+JARVIS_OLLAMA_NUM_BATCH=128
+JARVIS_OLLAMA_TIMEOUT=60
+JARVIS_OLLAMA_KEEP_ALIVE=5m
+JARVIS_FAILOVER_COOLDOWN=60
+JARVIS_PLAN_MODE=false
 ```
 
-O histórico, as ferramentas (function calling) e as imagens (capturas de tela) são
-traduzidos automaticamente para o formato OpenAI. Servidores locais normalmente não
-exigem chave. A pesquisa web com grounding (`web_search`) continua usando o Gemini,
-por ser um recurso específico dele.
+Qwen é o principal; Llama é tentado automaticamente quando o principal falha.
+Antes de trocar, o modelo que falhou é liberado do Ollama. Pedidos que já executaram
+ferramentas não são repetidos, evitando ações duplicadas. Os nomes completos
+dos modelos (incluindo os dois-pontos das tags) são preservados.
 
-### OpenCode Zen (LLMs gratuitas)
+A primeira resposta pode incluir o carregamento do modelo. `KEEP_ALIVE` evita
+recarregar a cada pedido. Contexto 8192 permite o catálogo completo de ferramentas;
+o lote 128 reduz o pico de memória. Outros modelos em uso competem por RAM/VRAM.
+As confirmações das ferramentas de risco permanecem ativas mesmo sem modo plano.
 
-O Jarvis também fala com o **OpenCode Zen** (`JARVIS_PROVIDER=zen`), que oferece
-modelos gratuitos (`qwen3.6-plus-free`, `glm-5-free`, `kimi-k2.5-free`, ...) num
-endpoint compatível com a API da OpenAI. A chave é lida de `JARVIS_ZEN_API_KEY`;
-se vazia, tenta `OPENCODE_API_KEY` e, por fim, a credencial do próprio OpenCode
-instalado (`~/.local/share/opencode/auth.json`).
-
-```dotenv
-JARVIS_PROVIDER=zen
-JARVIS_ZEN_MODEL=qwen3.6-plus-free
-```
-
-> O *free tier* do Zen é oferecido para uso de dentro do próprio OpenCode e pode
-> recusar chamadas externas (`FreeTierError` / "Model is unavailable"). Nesse
-> caso o failover abaixo segue para o próximo provedor automaticamente.
-
-### Failover automático entre provedores
-
-Defina uma cadeia de alvos em `JARVIS_PROVIDER_CHAIN` (separados por vírgula,
-cada um no formato `provedor` ou `provedor:modelo`). O Jarvis tenta na ordem
-configurada e, quando um alvo responde com erro de cota/limite (`429`,
-`RESOURCE_EXHAUSTED`, chave inválida, modelo indisponível...), ele sai da cadeia
-por `JARVIS_FAILOVER_COOLDOWN` segundos e a resposta vem do próximo alvo:
-
-```dotenv
-JARVIS_PROVIDER_CHAIN=zen:qwen3.6-plus-free,zen:glm-5-free,gemini
-JARVIS_FAILOVER_COOLDOWN=21600
-```
-
-Detalhes que importam:
-
-- O estado fica em `~/.jarvis/provider_state.json` e sobrevive a reinícios: uma
-  cota diária estourada hoje volta a ser usada sozinha amanhã.
-- Quando a própria mensagem de erro informa o prazo ("Retry in 6h43m"), ele é
-  respeitado — em vez do cooldown fixo.
-- Se **todos** os alvos estiverem esgotados, o Jarvis tenta a cadeia completa
-  como último recurso (um provedor que já voltou responde e é liberado na hora).
-  Se nada responder, ele avisa que as cotas estão esgotadas em vez de mostrar um
-  erro cru.
-- O failover só repete o turno quando o erro acontece **antes** de qualquer
-  ferramenta rodar: se uma ação já começou, o Jarvis não a executa duas vezes. A
-  aprovação do modo plano também vale para o turno inteiro, sem perguntar de novo.
+Os dois modelos locais selecionados suportam texto/ferramentas, sem visão.
+Gemini pode ser selecionado explicitamente para Live/visão; não está na cadeia
+local padrão. A pesquisa web tem uma alternativa pública sem chave Gemini.
 
 ## Confirmação e segurança
 
@@ -393,9 +389,10 @@ Outras salvaguardas:
 - O histórico local enviado em pedidos posteriores contém apenas texto; imagens de
   tela não são guardadas no histórico pelo Jarvis. Ainda assim, solicitações e
   imagens são transmitidas ao serviço Gemini para análise.
-- O reconhecimento de fala usa `recognize_google` e a síntese usa gTTS; o áudio e
-  o texto necessários são enviados aos serviços correspondentes pela internet. O
-  modo de texto continua disponível sem usar o microfone.
+- O áudio de entrada é transcrito localmente pelo faster-whisper e não é enviado
+  a um serviço de STT. A síntese de fala (`edge-tts` ou gTTS) continua usando a
+  rede; o modo de texto continua disponível sem usar o microfone. A exceção é o
+  modo opcional Live (`JARVIS_LIVE_MODE=true`), que envia áudio ao Gemini Live.
 - Mantenha `.env` privado e use uma chave da API protegida e restrita conforme as
   recomendações do Google.
 
@@ -419,3 +416,57 @@ python -m unittest tests.test_integration_protocols -v
 (PowerShell: `$env:JARVIS_INTEGRATION_TESTS=1`.)
 # assistentejarvis
 Assistente pessoal para realizar tarefas de forma automatica no seu computador, pode ser usado terminal, web locahost, ou LIVE real. Projeto ainda em desenvolvimento podendo apresentar falhas e erros.
+
+
+## Conversa por voz e interrupções
+
+A interface web usa por padrão a síntese de voz do navegador, sem aguardar a
+geração de MP3 no servidor. Selecione Voz online para edge-tts/gTTS ou Som
+desligado para texto. Voz e transcrição podem depender dos serviços do navegador
+e do Google; a inferência de conversa continua no Ollama local.
+
+Clique no microfone para conversar. Uma pausa de cerca de 700 ms encerra uma
+frase. A transcrição usa faster-whisper local; a síntese pode depender do
+navegador ou, no modo Voz online, de edge-tts/gTTS. Cancelamento de eco e
+supressão de ruído são solicitados ao navegador. A captura recalibra o ruído
+ambiente por um segundo a cada nova escuta e adapta o limiar de energia durante
+a espera pela fala.
+Quando o VAD detecta fala durante a resposta, o navegador para imediatamente
+o áudio local e envia `ABORT` pelo WebSocket; o servidor descarta as frases
+pendentes e fecha o stream ativo do Ollama. Também há o botão Interromper e a
+tecla Escape. Fones ajudam a evitar que o som dos alto-falantes seja confundido
+com uma interrupção. A transcrição ainda ocorre por trechos, não é uma sessão
+de áudio em tempo real.
+
+Pedidos interrompidos não podem iniciar novas ferramentas. Uma operação local
+de ferramenta já iniciada não pode ser desfeita pela interrupção. O stream de
+geração do Ollama é fechado no ABORT; pedidos novos aguardam a liberação do
+motor para não misturar histórico nem executar ações simultâneas.
+
+Confirmações e eventos de ferramentas são isolados por conexão do painel.
+Respostas antigas são descartadas e não voltam a tocar após a interrupção.
+
+### Prévia da câmera
+
+Ligar câmera abre somente uma prévia local no navegador, com permissão do
+usuário. Desligar câmera encerra as trilhas do dispositivo. Nenhum quadro é
+enviado, salvo ou analisado pelo Jarvis. Os dois modelos de conversa atuais
+não recebem imagens. Não foi instalado um modelo visual.
+
+
+### Controles de voz na janela compacta
+
+Execute `python -m jarvis.app --compact` no ambiente do projeto. O comando
+`--compact` não precisa mais de `--ui`. Se já houver um servidor Jarvis ativo,
+ele será reutilizado; outro serviço na mesma porta gera um erro claro.
+
+A janela oferece Ativar escuta/Desativar escuta e Interromper (também Escape).
+A captura só começa após clicar em Ativar escuta e depende de PyAudio e do
+microfone disponível. A transcrição usa o mesmo fluxo do servidor web.
+Durante o processamento e a reprodução, trechos capturados são descartados
+para evitar que o Jarvis transcreva a própria voz. Para cortar a resposta na
+janela compacta, use Interromper. O envio e a reprodução acontecem em threads,
+sem bloquear o Tkinter. O áudio é reproduzido com ffplay, mpv ou mpg123.
+Falhas do dispositivo e do reprodutor aparecem no histórico da janela.
+Fechar a janela interrompe a escuta, a reprodução e a conexão do cliente.
+O OpenCode e serviços de API removidos não são usados por esta interface.

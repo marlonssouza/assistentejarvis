@@ -25,13 +25,23 @@ from fastapi.responses import FileResponse
 
 from . import config, events, security, voice
 from .brain import chat_with_vision, reset_conversation
-from .config import UI_HOST, UI_PORT, UI_TOKEN, get_gemini_api_key
+from .config import (
+    UI_HOST,
+    UI_PORT,
+    UI_TOKEN,
+    WAKE_ENABLED,
+    WAKE_WORDS,
+    validate_provider_configuration,
+)
+from .logging_config import configure_logging
 from .skills import skills_payload
 
 logger = logging.getLogger(__name__)
 
 _WEBUI_DIR = Path(__file__).resolve().parent / "webui"
 _CONFIRM_TIMEOUT = 180
+_WS_PING_INTERVAL = 20
+_WS_PING_TIMEOUT = 20
 
 app = FastAPI(title="J.A.R.V.I.S.")
 
@@ -96,136 +106,257 @@ async def health() -> dict:
 
 
 class Session:
-    """Estado de uma conexão com o navegador."""
+    """Conversa com interrupção cooperativa e confirmações por conexão."""
 
-    def __init__(self, websocket: WebSocket) -> None:
+    def __init__(self, websocket):
         self.ws = websocket
         self.loop = asyncio.get_running_loop()
-        self.outbox: asyncio.Queue = asyncio.Queue()
-        self.pending: dict[str, Future] = {}
+        self.outbox = asyncio.Queue()
+        self.pending = {}
         self.busy = False
+        self.generation = 0
+        self.cancel_event = threading.Event()
+        self.request_lock = asyncio.Lock()
+        self.speech_mode = "server"
+        self._speech_queue = None
+        self._speech_task = None
 
-    # --- envio ---------------------------------------------------------
-    def emit(self, event: dict) -> None:
-        """Publica um evento para o navegador (seguro a partir de outras threads)."""
+    def emit(self, event):
         try:
             self.loop.call_soon_threadsafe(self.outbox.put_nowait, event)
         except RuntimeError:
-            logger.debug("Evento descartado: loop encerrado.")
+            pass
 
-    async def sender(self) -> None:
+    async def sender(self):
         while True:
             event = await self.outbox.get()
-            try:
-                await self.ws.send_text(json.dumps(event, ensure_ascii=False))
-            except Exception:  # noqa: BLE001 - conexão caiu
-                return
+            await self.ws.send_text(json.dumps(event, ensure_ascii=False))
 
-    # --- confirmação (chamada de outra thread) -------------------------
-    def confirm(self, description: str, risk: str) -> bool:
-        future: Future = Future()
+    def confirm(self, description, risk):
+        security.check_cancelled()
+        future = Future()
         confirm_id = uuid.uuid4().hex
         self.pending[confirm_id] = future
-        self.emit(
-            {
-                "type": "confirm_request",
-                "id": confirm_id,
-                "description": description,
-                "risk": risk,
-            }
-        )
+        self.emit({"type":"confirm_request", "id":confirm_id,
+                   "description":description,"risk":risk,"turn_id":self.generation})
         try:
+            security.check_cancelled()
             return bool(future.result(timeout=_CONFIRM_TIMEOUT))
         except FutureTimeout:
-            self.emit({"type": "info", "text": "Confirmação expirada; ação cancelada."})
             return False
         finally:
             self.pending.pop(confirm_id, None)
 
-    def resolve(self, confirm_id: str, approved: bool) -> None:
+    def resolve(self, confirm_id, approved):
         future = self.pending.get(confirm_id)
         if future is not None and not future.done():
-            future.set_result(bool(approved))
+            future.set_result(approved is True)
 
-    # --- fluxo principal ----------------------------------------------
-    async def handle_text(self, text: str) -> None:
+    def interrupt(self, notify=True):
+        security.cancel_session(self.cancel_event)
+        self.generation += 1
+        if self._speech_queue is not None:
+            while not self._speech_queue.empty():
+                try:
+                    self._speech_queue.get_nowait()
+                except asyncio.QueueEmpty:
+                    break
+            self._speech_queue.put_nowait(None)
+        if self._speech_task is not None and not self._speech_task.done():
+            self._speech_task.cancel()
+        for future in list(self.pending.values()):
+            if not future.done():
+                future.set_result(False)
+        if notify:
+            self.emit({"type":"interrupted","turn_id":self.generation})
+        return self.generation
+
+    def _worker(self, text, turn, cancelled, on_sentence=None):
+        listener = lambda event: self.emit(dict(event, turn_id=turn))
+        with security.session_context(self.confirm, cancelled), events.scoped_listener(listener):
+            security.check_cancelled()
+            return chat_with_vision(text, None, on_sentence=on_sentence)
+
+    async def _speak_stream(self, queue, turn, cancelled):
+        while True:
+            sentence = await queue.get()
+            if sentence is None:
+                return
+            if turn != self.generation or cancelled.is_set():
+                continue
+            try:
+                await self.speak(sentence, turn)
+            except asyncio.CancelledError:
+                return
+
+    async def handle_text(self, text):
         text = (text or "").strip()
         if not text:
             return
-        if self.busy:
-            self.emit(
-                {"type": "info", "text": "Ainda estou concluindo o pedido anterior..."}
+        turn = self.interrupt(notify=False)
+        async with self.request_lock:
+            if turn != self.generation:
+                return
+            self.cancel_event = cancelled = threading.Event()
+            self.busy = True
+            self.emit({"type":"user","text":text,"turn_id":turn})
+            self.emit({"type":"status","state":"thinking","turn_id":turn})
+            streamed_sentences = threading.Event()
+            speech_queue = asyncio.Queue() if self.speech_mode == "server" else None
+            speech_task = (
+                asyncio.create_task(self._speak_stream(speech_queue, turn, cancelled))
+                if speech_queue is not None else None
             )
-            return
-        self.busy = True
-        self.emit({"type": "user", "text": text})
-        self.emit({"type": "status", "state": "thinking"})
-        try:
-            reply = await asyncio.to_thread(chat_with_vision, text, None)
-        except Exception as exc:  # noqa: BLE001 - reportar ao usuário
-            logger.exception("Falha ao processar o pedido.")
-            self.emit({"type": "error", "text": _friendly_error(exc)})
-            self.emit({"type": "status", "state": "idle"})
-        else:
-            self.emit({"type": "assistant", "text": reply})
-            await self.speak(reply)
-        finally:
-            self.busy = False
+            self._speech_queue = speech_queue
+            self._speech_task = speech_task
 
-    async def speak(self, text: str) -> None:
-        text = (text or "").strip()
+            def queue_sentence(sentence):
+                if speech_queue is None or cancelled.is_set():
+                    return
+                queued = asyncio.run_coroutine_threadsafe(
+                    speech_queue.put(sentence), self.loop
+                )
+                queued.result()
+                streamed_sentences.set()
+
+            try:
+                reply = await asyncio.to_thread(
+                    self._worker,
+                    text,
+                    turn,
+                    cancelled,
+                    queue_sentence if speech_queue is not None else None,
+                )
+                if turn != self.generation or cancelled.is_set():
+                    return
+                self.emit({"type":"assistant","text":reply,"turn_id":turn,
+                           "speech_mode":self.speech_mode})
+                if self.speech_mode == "server" and not streamed_sentences.is_set():
+                    await self.speak(reply, turn)
+                elif self.speech_mode != "server":
+                    self.emit({"type":"status","state":"idle","turn_id":turn})
+            except security.TurnCancelled:
+                pass
+            except Exception as exc:
+                if turn == self.generation:
+                    logger.exception("Falha no pedido.")
+                    self.emit({"type":"error","text":_friendly_error(exc),"turn_id":turn})
+                    self.emit({"type":"status","state":"idle","turn_id":turn})
+            finally:
+                if speech_queue is not None and speech_task is not None:
+                    await speech_queue.put(None)
+                    try:
+                        await speech_task
+                    except asyncio.CancelledError:
+                        pass
+                    if self._speech_queue is speech_queue:
+                        self._speech_queue = None
+                        self._speech_task = None
+                self.busy = False
+
+    async def speak(self, text, turn=None):
+        turn = self.generation if turn is None else turn
+        self.emit({"type":"status","state":"speaking","turn_id":turn})
+        try:
+            audio = await asyncio.wait_for(asyncio.to_thread(voice.synthesize_mp3, text), timeout=12)
+            if turn == self.generation:
+                self.emit({"type":"audio","format":"mp3",
+                           "data":base64.b64encode(audio).decode("ascii"),"turn_id":turn})
+        except Exception:
+            if turn == self.generation:
+                self.emit({"type":"info","text":"A voz demorou; a resposta está disponível em texto.","turn_id":turn})
+                self.emit({"type":"status","state":"idle","turn_id":turn})
+
+    async def handle_audio(self, data_b64, suffix=".webm"):
+        turn = self.generation
+        try:
+            if len(data_b64) > 8_000_000 or suffix not in {".webm", ".ogg", ".wav", ".mp4"}:
+                raise ValueError()
+            raw = base64.b64decode(data_b64, validate=True)
+        except (ValueError, TypeError):
+            self.emit({"type":"error","text":"Áudio inválido."})
+            return
+        self.emit({"type":"status","state":"transcribing","turn_id":turn})
+        try:
+            text = await asyncio.wait_for(asyncio.to_thread(voice.transcribe_audio_bytes, raw, suffix), timeout=120)
+        except asyncio.TimeoutError:
+            logger.warning("Tempo limite excedido ao transcrever áudio.")
+            if turn != self.generation:
+                return
+            self.emit({"type":"status","state":"idle","turn_id":turn})
+            self.emit({"type":"error","text":"O reconhecimento local demorou demais. Tente um áudio mais curto.","turn_id":turn})
+            return
+        except Exception as exc:
+            logger.exception("Falha ao transcrever áudio com faster-whisper.")
+            if turn != self.generation:
+                return
+            self.emit({"type":"status","state":"idle","turn_id":turn})
+            self.emit({"type":"error","text":f"Falha no reconhecimento local de fala: {exc}","turn_id":turn})
+            return
+        if turn != self.generation:
+            return
         if not text:
-            self.emit({"type": "status", "state": "idle"})
+            self.emit({"type":"status","state":"idle","turn_id":turn})
+            self.emit({"type":"info","text":"Não entendi essa parte. Pode repetir?","turn_id":turn})
             return
-        self.emit({"type": "status", "state": "speaking"})
-        try:
-            audio = await asyncio.to_thread(voice.synthesize_mp3, text)
-        except Exception:  # noqa: BLE001 - segue sem áudio
-            logger.exception("Falha ao sintetizar a fala.")
-            self.emit({"type": "status", "state": "idle"})
+        if WAKE_ENABLED:
+            command = voice.extract_wake_command(text, WAKE_WORDS)
+            if command is None:
+                self.emit({"type":"status","state":"idle","turn_id":turn})
+                self.emit({
+                    "type":"info",
+                    "text":(
+                        f"Não reconheci a palavra de ativação no início. "
+                        f"A transcrição local foi: “{text}”. "
+                        "Diga “Jarvis” no início da frase para ativar o assistente."
+                    ),
+                    "turn_id":turn,
+                })
+                return
+            if not command:
+                self.emit({"type":"status","state":"idle","turn_id":turn})
+                self.emit({
+                    "type":"info",
+                    "text":"Estou ouvindo, Senhor. Diga seu pedido após “Jarvis”.",
+                    "turn_id":turn,
+                })
+                return
+            text = command
+        if turn != self.generation:
             return
-        self.emit(
-            {
-                "type": "audio",
-                "format": "mp3",
-                "data": base64.b64encode(audio).decode("ascii"),
-            }
-        )
+        turn = self.interrupt()
+        self.emit({"type":"transcript","text":text,"turn_id":turn})
+        import re
+        stop = re.sub(r"[^\w\s]", "", text.casefold()).strip()
+        stop = re.sub(r"^(jarvis\s+)", "", stop)
+        if stop in {"pare","parar","silêncio","silencio","cancele","pode parar","chega"}:
+            self.interrupt()
+            return
+        await self.handle_text(text)
 
-    async def handle_audio(self, data_b64: str, suffix: str = ".webm") -> None:
-        if self.busy:
-            self.emit({"type": "info", "text": "Ainda estou concluindo o pedido anterior..."})
-            return
-        try:
-            raw = base64.b64decode(data_b64)
-        except Exception:  # noqa: BLE001
-            self.emit({"type": "error", "text": "Áudio inválido."})
-            return
-        self.emit({"type": "status", "state": "transcribing"})
-        transcript = await asyncio.to_thread(voice.transcribe_audio_bytes, raw, suffix)
-        if not transcript:
-            self.emit({"type": "status", "state": "idle"})
-            self.emit({"type": "info", "text": "Não entendi o áudio. Tente novamente."})
-            return
-        self.emit({"type": "transcript", "text": transcript})
-        await self.handle_text(transcript)
 
-
-async def _route(session: Session, message: dict) -> None:
+async def _route(session, message):
     kind = message.get("type")
     if kind == "user_text":
         await session.handle_text(message.get("text", ""))
     elif kind == "audio":
-        await session.handle_audio(
-            message.get("data", ""), message.get("suffix", ".webm")
-        )
+        await session.handle_audio(message.get("data", ""), message.get("suffix", ".webm"))
+    elif kind == "preferences":
+        mode = message.get("speech_mode")
+        if mode in {"browser","server","none"}:
+            session.speech_mode = mode
+    elif kind in {"ABORT", "abort", "interrupt"}:
+        session.interrupt()
     elif kind == "confirm":
         session.resolve(message.get("id", ""), message.get("approved", False))
     elif kind == "reset":
-        reset_conversation()
-        session.emit({"type": "info", "text": "Histórico da conversa limpo."})
+        if session.busy:
+            session.emit({"type":"info","text":"Interrompa e aguarde o pedido terminar antes de limpar a conversa."})
+        else:
+            reset_conversation()
+            session.emit({"type":"info","text":"Histórico da conversa limpo."})
     elif kind == "ping":
-        session.emit({"type": "pong"})
+        session.emit({"type":"pong"})
 
 
 @app.websocket("/ws")
@@ -240,7 +371,6 @@ async def websocket_endpoint(websocket: WebSocket) -> None:
     await websocket.accept()
     session = Session(websocket)
     events.subscribe(session.emit)
-    security.register_confirm_handler(session.confirm)
     sender = asyncio.create_task(session.sender())
     tasks: set[asyncio.Task] = set()
 
@@ -263,6 +393,11 @@ async def websocket_endpoint(websocket: WebSocket) -> None:
             # A confirmação é respondida imediatamente, sem esperar o pedido em
             # curso terminar: sem isso o clique em Aprovar/Recusar fica preso na
             # fila de leitura enquanto o pedido anterior ainda está executando.
+            if not isinstance(message, dict):
+                continue
+            if message.get("type") in {"ABORT", "abort", "interrupt"}:
+                session.interrupt()
+                continue
             if message.get("type") == "confirm":
                 session.resolve(message.get("id", ""), message.get("approved", False))
                 continue
@@ -278,10 +413,10 @@ async def websocket_endpoint(websocket: WebSocket) -> None:
     except Exception:  # noqa: BLE001
         logger.exception("Erro na conexão da interface.")
     finally:
+        session.interrupt(notify=False)
         for task in list(tasks):
             task.cancel()
         events.unsubscribe(session.emit)
-        security.register_confirm_handler(None)
         sender.cancel()
 
 
@@ -324,7 +459,8 @@ def start_background_services() -> None:
 
 def run(open_browser: bool = True) -> None:
     """Sobe o servidor local e abre a interface no navegador."""
-    get_gemini_api_key()  # falha cedo se a chave não estiver configurada
+    configure_logging()
+    validate_provider_configuration()  # falha cedo se a chave não estiver configurada
     start_background_services()
     token = getattr(config, "UI_TOKEN", "") or ""
     query = f"?token={token}" if token else ""
@@ -341,7 +477,14 @@ def run(open_browser: bool = True) -> None:
             threading.Timer(1.5, lambda: webbrowser.open(url)).start()
         except Exception:  # noqa: BLE001
             pass
-    uvicorn.run(app, host=UI_HOST, port=UI_PORT, log_level="warning")
+    uvicorn.run(
+        app,
+        host=UI_HOST,
+        port=UI_PORT,
+        log_level="warning",
+        ws_ping_interval=_WS_PING_INTERVAL,
+        ws_ping_timeout=_WS_PING_TIMEOUT,
+    )
 
 
 if __name__ == "__main__":  # pragma: no cover

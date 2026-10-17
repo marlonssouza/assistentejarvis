@@ -2,8 +2,11 @@ google-genai
 mss
 Pillow
 pyautogui
-SpeechRecognition[audio]
 PyAudio
+faster-whisper>=1.1.0
+huggingface-hub>=0.21,<1.0
+numpy>=1.24
+onnxruntime>=1.16.1
 gTTS
 python-dotenv
 edge-tts
@@ -16,7 +19,7 @@ psutil
 pyperclip
 screen-brightness-control
 pycaw; sys_platform == "win32"
-mcp
+mcp==1.30.0
 fastapi
 uvicorn[standard]
 

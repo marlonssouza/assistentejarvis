@@ -140,7 +140,7 @@ def _load_sdk() -> SimpleNamespace:
         from mcp.client.streamable_http import streamablehttp_client
     except ImportError as exc:  # pragma: no cover - depende do ambiente
         raise RuntimeError(
-            "O pacote 'mcp' não está instalado. Instale com 'pip install mcp'."
+            "O SDK 'mcp' não está instalado ou é incompatível. Instale com 'pip install mcp==1.30.0'."
         ) from exc
     return SimpleNamespace(
         ClientSession=ClientSession,

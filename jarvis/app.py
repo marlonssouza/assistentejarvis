@@ -10,13 +10,11 @@ import argparse
 import asyncio
 import logging
 
-logging.basicConfig(
-    level=logging.INFO,
-    format="%(asctime)s %(levelname)s %(name)s: %(message)s",
-)
+from .logging_config import configure_logging
 
 
 def main() -> None:
+    configure_logging()
     parser = argparse.ArgumentParser(description="J.A.R.V.I.S.")
     parser.add_argument("--ui", "--web", action="store_true", dest="ui")
     parser.add_argument("--compact", action="store_true", help="Força a interface compacta (Tkinter)")
@@ -27,7 +25,7 @@ def main() -> None:
 
     use_compact = args.compact or UI_MODE == "compact"
 
-    if args.ui and use_compact:
+    if (args.ui or args.compact) and use_compact:
         from jarvis.compact_app import main as compact_main
 
         compact_main()
@@ -39,11 +37,11 @@ def main() -> None:
         run(open_browser=not args.no_browser)
         return
 
-    from jarvis.config import LIVE_MODE, get_gemini_api_key, ConfigurationError
+    from jarvis.config import LIVE_MODE, validate_provider_configuration, ConfigurationError
     from main import main as terminal_main
 
     try:
-        get_gemini_api_key()
+        validate_provider_configuration()
     except ConfigurationError as exc:
         logging.error("%s", exc)
         return

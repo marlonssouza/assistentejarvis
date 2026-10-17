@@ -26,21 +26,21 @@ class ChainTests(unittest.TestCase):
             self.assertEqual(failover.chain(), [failover.Target("gemini")])
 
     def test_chain_is_parsed_in_order(self):
-        configured = ("zen:qwen3.6-plus-free", "zen:glm-5-free", "gemini")
+        configured = ("ollama:qwen2.5:7b-instruct-q4_K_M", "ollama:llama3.1:8b", "gemini")
         with patch.object(config, "PROVIDER_CHAIN", configured):
             self.assertEqual(
                 failover.chain(),
                 [
-                    failover.Target("zen", "qwen3.6-plus-free"),
-                    failover.Target("zen", "glm-5-free"),
+                    failover.Target("ollama", "qwen2.5:7b-instruct-q4_K_M"),
+                    failover.Target("ollama", "llama3.1:8b"),
                     failover.Target("gemini"),
                 ],
             )
 
-    def test_zen_without_model_uses_default_soon(self):
-        with patch.object(config, "PROVIDER_CHAIN", ("zen",)):
+    def test_ollama_without_model_uses_default_soon(self):
+        with patch.object(config, "PROVIDER_CHAIN", ("ollama",)):
             chain = failover.chain()
-        self.assertEqual(chain, [failover.Target("zen", None)])
+        self.assertEqual(chain, [failover.Target("ollama", None)])
 
     def test_unknown_targets_are_skipped_and_valid_ones_kept(self):
         with patch.object(config, "PROVIDER_CHAIN", ("wat", "gemini", ":")):
@@ -49,9 +49,9 @@ class ChainTests(unittest.TestCase):
     def test_all_invalid_falls_back_to_active_provider(self):
         with (
             patch.object(config, "PROVIDER_CHAIN", ("wat", "nada")),
-            patch.object(config, "PROVIDER", "zen"),
+            patch.object(config, "PROVIDER", "ollama"),
         ):
-            self.assertEqual(failover.chain(), [failover.Target("zen")])
+            self.assertEqual(failover.chain(), [failover.Target("ollama")])
 
 
 class QuotaDetectionTests(unittest.TestCase):
@@ -63,6 +63,8 @@ class QuotaDetectionTests(unittest.TestCase):
             ProviderError("Provedor retornou 503: model overloaded"),
             ProviderError("Provedor retornou 401: chave revogada"),
             RuntimeError("rate limit exceeded, try again later"),
+            ProviderError("Falha ao contatar o provedor: conexão recusada"),
+            ProviderError("Ollama timeout aguardando resposta do modelo"),
             ProviderError("Provedor retornou 404: model not found"),
             ProviderError(
                 'Provedor retornou 400: {"error":{"type":"server_error",'
@@ -81,7 +83,6 @@ class QuotaDetectionTests(unittest.TestCase):
                 "O Gemini excedeu o limite de 8 chamadas de ferramentas nesta solicitação."
             ),
             ProviderError("Provedor retornou 400: solicitação malformada"),
-            ProviderError("Falha ao contatar o provedor: conexão recusada"),
             ProviderError("O provedor retornou uma resposta inválida (não-JSON)."),
         ]
         for exc in cases:
@@ -123,8 +124,8 @@ class CooldownTests(unittest.TestCase):
         self.addCleanup(failover.reset_state)
 
     def test_mark_exhausted_skips_target_and_persists(self):
-        target = failover.Target("zen", "qwen3.6-plus-free")
-        with patch.object(config, "PROVIDER_CHAIN", ("zen:qwen3.6-plus-free", "gemini")):
+        target = failover.Target("ollama", "qwen2.5:7b-instruct-q4_K_M")
+        with patch.object(config, "PROVIDER_CHAIN", ("ollama:qwen2.5:7b-instruct-q4_K_M", "gemini")):
             failover.mark_exhausted(target, seconds=3600)
             self.assertEqual(failover.candidates(), [failover.Target("gemini")])
 
@@ -133,24 +134,24 @@ class CooldownTests(unittest.TestCase):
             self.assertEqual(failover.candidates(), [failover.Target("gemini")])
 
         data = json.loads(failover.STATE_FILE.read_text(encoding="utf-8"))
-        self.assertIn("zen:qwen3.6-plus-free", data)
-        self.assertGreater(data["zen:qwen3.6-plus-free"], time.time())
+        self.assertIn("ollama:qwen2.5:7b-instruct-q4_K_M", data)
+        self.assertGreater(data["ollama:qwen2.5:7b-instruct-q4_K_M"], time.time())
 
     def test_cooldown_expiry_restores_target(self):
         # Escreve um cooldown já vencido direto no estado (o mínimo real é 5s).
         failover.STATE_FILE.write_text(
-            json.dumps({"zen": time.time() - 10}), encoding="utf-8"
+            json.dumps({"ollama": time.time() - 10}), encoding="utf-8"
         )
         failover.reset_state()
-        with patch.object(config, "PROVIDER_CHAIN", ("zen", "gemini")):
+        with patch.object(config, "PROVIDER_CHAIN", ("ollama", "gemini")):
             self.assertEqual(
                 failover.candidates(),
-                [failover.Target("zen"), failover.Target("gemini")],
+                [failover.Target("ollama"), failover.Target("gemini")],
             )
 
     def test_error_retry_hint_is_honoured(self):
         target = failover.Target("gemini")
-        with patch.object(config, "PROVIDER_CHAIN", ("gemini", "zen")):
+        with patch.object(config, "PROVIDER_CHAIN", ("gemini", "ollama")):
             failover.mark_exhausted(
                 target,
                 error=Exception("429 RESOURCE_EXHAUSTED. Retry in 6h43m"),
@@ -160,14 +161,14 @@ class CooldownTests(unittest.TestCase):
             self.assertAlmostEqual(data["gemini"], expected, delta=120)
 
     def test_recover_releases_target(self):
-        target = failover.Target("zen")
-        with patch.object(config, "PROVIDER_CHAIN", ("zen", "gemini")):
+        target = failover.Target("ollama")
+        with patch.object(config, "PROVIDER_CHAIN", ("ollama", "gemini")):
             failover.mark_exhausted(target, seconds=3600)
             failover.recover(target)
             self.assertEqual(
                 failover.candidates(), [target, failover.Target("gemini")]
             )
-        self.assertFalse(failover.STATE_FILE.exists() and "zen" in json.loads(
+        self.assertFalse(failover.STATE_FILE.exists() and "ollama" in json.loads(
             failover.STATE_FILE.read_text(encoding="utf-8")
         ))
 
@@ -177,12 +178,12 @@ class CooldownTests(unittest.TestCase):
 
     def test_all_exhausted_falls_back_to_full_chain(self):
         """Nunca ficamos sem alvo: com tudo esgotado, tenta a cadeia completa."""
-        with patch.object(config, "PROVIDER_CHAIN", ("zen", "gemini")):
-            failover.mark_exhausted(failover.Target("zen"), seconds=3600)
+        with patch.object(config, "PROVIDER_CHAIN", ("ollama", "gemini")):
+            failover.mark_exhausted(failover.Target("ollama"), seconds=3600)
             failover.mark_exhausted(failover.Target("gemini"), seconds=3600)
             self.assertEqual(
                 failover.candidates(),
-                [failover.Target("zen"), failover.Target("gemini")],
+                [failover.Target("ollama"), failover.Target("gemini")],
             )
 
 
@@ -197,9 +198,9 @@ class MessageTests(unittest.TestCase):
 class RetriableErrorTests(unittest.TestCase):
     def test_keeps_original_error_for_retry_hint(self):
         original = Exception("Retry in 30m")
-        error = failover.RetriableProviderError(failover.Target("zen"), original)
+        error = failover.RetriableProviderError(failover.Target("ollama"), original)
         self.assertIs(error.original, original)
-        self.assertIn("zen", str(error))
+        self.assertIn("ollama", str(error))
 
 
 if __name__ == "__main__":

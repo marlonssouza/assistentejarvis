@@ -50,6 +50,12 @@ class ReadWebpageTests(unittest.TestCase):
 
 
 class WebSearchTests(unittest.TestCase):
+    def setUp(self):
+        from jarvis import config
+        p = patch.object(config, "PROVIDER_CHAIN", ("gemini",))
+        p.start()
+        self.addCleanup(p.stop)
+
     def _fake_response(self):
         return SimpleNamespace(
             text="O dolar esta em R$ 5,00.",

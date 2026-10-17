@@ -1,60 +1,290 @@
 import asyncio
 import io
 import logging
+import math
 import os
 import platform
 import shutil
+import struct
 import subprocess
+import tempfile
+import threading
+import time
+import urllib.error
+import urllib.request
+import wave
+from collections import deque
+from pathlib import Path
 
-import speech_recognition as sr
+import pyaudio
 from gtts import gTTS
 from gtts.tts import gTTSError
 
 from .config import (
     AUDIO_OUTPUT_FILE,
+    STT_MODEL,
+    STT_MODEL_DIR,
     TTS_BACKEND,
     TTS_RATE,
     TTS_VOICE,
     TTS_VOLUME,
+    VAD_THRESHOLD,
+    WAKE_ENABLED,
+    WAKE_WORDS,
 )
 
 logger = logging.getLogger(__name__)
+_WHISPER_MODEL = None
+_WHISPER_MODEL_LOCK = threading.Lock()
+_WHISPER_TRANSCRIBE_LOCK = threading.Lock()
+_SILERO_VAD_MODEL = None
+_SILERO_VAD_MODEL_LOCK = threading.Lock()
+_MICROPHONE_RATE = 16000
+_MICROPHONE_CHUNK = 512
+_SILERO_VAD_THRESHOLD = VAD_THRESHOLD
+_ENERGY_THRESHOLD_INITIAL = 300.0
+_DYNAMIC_ENERGY_RATIO = 1.5
+_DYNAMIC_ENERGY_DAMPING = 0.15
+_AMBIENT_CALIBRATION_DURATION = 0.8
+_SILERO_VAD_CONTEXT_SAMPLES = 64
+_SILERO_VAD_STATE_SHAPE = (2, 1, 128)
+_SILERO_VAD_MODEL_URL = (
+   "https://raw.githubusercontent.com/snakers4/silero-vad/"
+   "bfdc0193023f121ea5b3cc7b176dbed570a68a59/"
+   "src/silero_vad/data/silero_vad.onnx"
+)
+_SILERO_VAD_MODEL_PATH = (
+   Path.home() / ".jarvis" / "models" / "silero_vad.onnx"
+)
+_SILENCE_CHUNK = b"\x00\x00" * _MICROPHONE_CHUNK
+# Mantém alguns blocos anteriores ao início da fala para não cortar o ataque
+# da palavra de ativação ("Jarvis" costuma começar suave).
+_PRE_ROLL_CHUNKS = 8
+_PRE_ROLL_ENERGY_RATIO = 0.3
 
 
-def listen_microphone() -> str | None:
-    """Listens for a short Portuguese utterance; returns None on silence."""
-    recognizer = sr.Recognizer()
+def _audio_level(audio: bytes) -> float:
+    samples = struct.unpack(f"<{len(audio) // 2}h", audio)
+    if not samples:
+        return 0.0
+    return math.sqrt(sum(sample * sample for sample in samples) / len(samples))
+
+
+def _adapt_energy_threshold(threshold: float, energy: float, duration: float) -> float:
+    damping = _DYNAMIC_ENERGY_DAMPING**duration
+    target = energy * _DYNAMIC_ENERGY_RATIO
+    return threshold * damping + target * (1 - damping)
+
+
+def _adjust_for_ambient_noise(
+    stream,
+    duration: float = _AMBIENT_CALIBRATION_DURATION,
+    stop_event: threading.Event | None = None,
+) -> float | None:
+    """Calibrate the adaptive energy threshold from ambient microphone noise."""
+    samples_to_read = int(_MICROPHONE_RATE * duration)
+    samples_read = 0
+    threshold = _ENERGY_THRESHOLD_INITIAL
+    while samples_read < samples_to_read:
+        if stop_event is not None and stop_event.is_set():
+            return None
+        frames = min(_MICROPHONE_CHUNK, samples_to_read - samples_read)
+        chunk = stream.read(frames, exception_on_overflow=False)
+        if frames != _MICROPHONE_CHUNK:
+            chunk += b"\x00\x00" * (_MICROPHONE_CHUNK - frames)
+        threshold = _adapt_energy_threshold(
+            threshold,
+            _audio_level(chunk),
+            frames / _MICROPHONE_RATE,
+        )
+        samples_read += frames
+    return threshold
+
+
+def _download_silero_vad_model() -> None:
+   _SILERO_VAD_MODEL_PATH.parent.mkdir(parents=True, exist_ok=True)
+   descriptor, temporary_path = tempfile.mkstemp(
+       prefix="silero-vad-", suffix=".onnx", dir=_SILERO_VAD_MODEL_PATH.parent
+   )
+   size = 0
+   try:
+       with os.fdopen(descriptor, "wb") as model_file:
+           with urllib.request.urlopen(_SILERO_VAD_MODEL_URL, timeout=30) as response:
+               while chunk := response.read(64 * 1024):
+                   size += len(chunk)
+                   if size > 20 * 1024 * 1024:
+                       raise RuntimeError("O arquivo do modelo Silero VAD excede o limite esperado.")
+                   model_file.write(chunk)
+           if size == 0:
+               raise RuntimeError("O download do modelo Silero VAD retornou um arquivo vazio.")
+           model_file.flush()
+           os.fsync(model_file.fileno())
+       os.replace(temporary_path, _SILERO_VAD_MODEL_PATH)
+   except urllib.error.URLError as exc:
+       raise RuntimeError(
+           "Não foi possível baixar o modelo Silero VAD. Verifique a conexão e tente novamente."
+       ) from exc
+   finally:
+       if os.path.exists(temporary_path):
+           os.unlink(temporary_path)
+
+
+def _get_silero_vad_model():
+   global _SILERO_VAD_MODEL
+   with _SILERO_VAD_MODEL_LOCK:
+       if _SILERO_VAD_MODEL is None:
+           if not _SILERO_VAD_MODEL_PATH.is_file():
+               _download_silero_vad_model()
+           import onnxruntime
+
+           options = onnxruntime.SessionOptions()
+           options.inter_op_num_threads = 1
+           options.intra_op_num_threads = 1
+           _SILERO_VAD_MODEL = onnxruntime.InferenceSession(
+               str(_SILERO_VAD_MODEL_PATH),
+               providers=["CPUExecutionProvider"],
+               sess_options=options,
+           )
+       return _SILERO_VAD_MODEL
+
+
+class _SileroVADDetector:
+   def __init__(self, model):
+       import numpy as np
+
+       self.model = model
+       self.state = np.zeros(_SILERO_VAD_STATE_SHAPE, dtype=np.float32)
+       self.context = np.zeros(
+           (1, _SILERO_VAD_CONTEXT_SAMPLES), dtype=np.float32
+       )
+       self.sample_rate = np.asarray(_MICROPHONE_RATE, dtype=np.int64)
+
+   def speech_probability(self, audio: bytes) -> float:
+       import numpy as np
+
+       samples = np.frombuffer(audio, dtype=np.int16)
+       if samples.size != _MICROPHONE_CHUNK:
+           raise ValueError(
+               f"Silero VAD exige blocos de {_MICROPHONE_CHUNK} amostras."
+           )
+       normalized = samples.astype(np.float32).reshape(1, -1) / 32768.0
+       model_input = np.concatenate((self.context, normalized), axis=1)
+       probabilities, self.state = self.model.run(
+           None,
+           {
+               "input": model_input,
+               "state": self.state,
+               "sr": self.sample_rate,
+           },
+       )
+       self.context = model_input[:, -_SILERO_VAD_CONTEXT_SAMPLES:]
+       return float(probabilities[0][0])
+
+
+def capture_microphone_audio(
+    timeout: float = 5,
+    phrase_time_limit: float = 10,
+    stop_event: threading.Event | None = None,
+) -> bytes | None:
+    """Captures one utterance and returns mono 16 kHz PCM as WAV bytes."""
+    audio = pyaudio.PyAudio()
+    stream = None
     try:
-        microphone = sr.Microphone()
-    except AttributeError as exc:
-        raise RuntimeError(
-            "O suporte ao microfone não está instalado. Instale "
-            "SpeechRecognition[audio] e reinicie o Jarvis."
-        ) from exc
-
-    try:
-        with microphone as source:
-            print("Ouvindo...")
-            recognizer.adjust_for_ambient_noise(source, duration=0.5)
-            audio = recognizer.listen(source, timeout=5, phrase_time_limit=10)
-    except sr.WaitTimeoutError:
-        return None
+        stream = audio.open(
+            format=pyaudio.paInt16,
+            channels=1,
+            rate=_MICROPHONE_RATE,
+            input=True,
+            frames_per_buffer=_MICROPHONE_CHUNK,
+        )
+        print("Ouvindo...")
+        energy_threshold = _adjust_for_ambient_noise(
+            stream,
+            duration=_AMBIENT_CALIBRATION_DURATION,
+            stop_event=stop_event,
+        )
+        if energy_threshold is None:
+            return None
+        detector = _SileroVADDetector(_get_silero_vad_model())
+        frames = []
+        pre_roll: deque[bytes] = deque(maxlen=_PRE_ROLL_CHUNKS)
+        started_at = None
+        last_voice_at = None
+        pending_silence_chunks = 0
+        deadline = time.monotonic() + timeout
+        while stop_event is None or not stop_event.is_set():
+            now = time.monotonic()
+            if started_at is None and now >= deadline:
+                return None
+            if started_at is not None and now - started_at >= phrase_time_limit:
+                break
+            chunk = stream.read(_MICROPHONE_CHUNK, exception_on_overflow=False)
+            now = time.monotonic()
+            energy = _audio_level(chunk)
+            if started_at is None:
+                energy_threshold = _adapt_energy_threshold(
+                    energy_threshold,
+                    energy,
+                    _MICROPHONE_CHUNK / _MICROPHONE_RATE,
+                )
+            speech_detected = energy >= energy_threshold and (
+                detector.speech_probability(chunk) > _SILERO_VAD_THRESHOLD
+            )
+            if speech_detected:
+                if started_at is None:
+                    started_at = now
+                    if pre_roll:
+                        frames.extend(pre_roll)
+                        pre_roll.clear()
+                if pending_silence_chunks:
+                    frames.extend([_SILENCE_CHUNK] * pending_silence_chunks)
+                    pending_silence_chunks = 0
+                frames.append(chunk)
+                last_voice_at = now
+            elif started_at is not None:
+                pending_silence_chunks += 1
+                if last_voice_at is not None and now - last_voice_at >= 0.6:
+                    break
+            elif energy >= energy_threshold * _PRE_ROLL_ENERGY_RATIO:
+                pre_roll.append(chunk)
+            else:
+                pre_roll.clear()
+        else:
+            return None
+        if not frames:
+            return None
+        buffer = io.BytesIO()
+        with wave.open(buffer, "wb") as wav_file:
+            wav_file.setnchannels(1)
+            wav_file.setsampwidth(2)
+            wav_file.setframerate(_MICROPHONE_RATE)
+            wav_file.writeframes(b"".join(frames))
+        return buffer.getvalue()
     except OSError as exc:
         raise RuntimeError(
             "Não foi possível acessar o microfone. Verifique o dispositivo e as permissões."
         ) from exc
+    finally:
+        try:
+            if stream is not None:
+                try:
+                    stream.stop_stream()
+                finally:
+                    stream.close()
+        finally:
+            audio.terminate()
 
-    try:
-        text = recognizer.recognize_google(audio, language="pt-BR")
-    except sr.UnknownValueError:
+
+def listen_microphone(
+    stop_event: threading.Event | None = None,
+) -> str | None:
+    """Listens for a short Portuguese utterance and transcribes it locally."""
+    audio = capture_microphone_audio(stop_event=stop_event)
+    if not audio or (stop_event is not None and stop_event.is_set()):
         return None
-    except sr.RequestError as exc:
-        raise RuntimeError(
-            "Não foi possível acessar o reconhecimento de fala. "
-            "Verifique a conexão e tente novamente."
-        ) from exc
-
-    print(f"Você disse: {text}")
+    text = transcribe_audio_bytes(audio, ".wav")
+    if text:
+        print(f"Você disse: {text}")
     return text
 
 
@@ -63,8 +293,27 @@ def listen_for_wake_word(wake_words: tuple[str, ...]) -> bool:
     text = listen_microphone()
     if not text:
         return False
-    normalized = text.casefold()
-    return any(word in normalized for word in wake_words)
+    return extract_wake_command(text, wake_words) is not None
+
+
+def extract_wake_command(
+    text: str, wake_words: tuple[str, ...]
+) -> str | None:
+    """Return text following a wake word at the utterance start, if present."""
+    if not isinstance(text, str):
+        return None
+    normalized = text.strip().lstrip(".,!?;:¿¡\"'“‘([{").strip()
+    folded = normalized.casefold()
+    for wake_word in sorted(wake_words, key=len, reverse=True):
+        word = wake_word.strip().casefold()
+        if not word or not folded.startswith(word):
+            continue
+        if len(folded) > len(word) and (
+            folded[len(word)].isalnum() or folded[len(word)] == "_"
+        ):
+            continue
+        return normalized[len(word) :].lstrip(" \t,.:;!?-\"'“”‘’")
+    return None
 
 
 _BLOCKING_PLAYERS = (
@@ -179,45 +428,67 @@ def synthesize_mp3(text: str) -> bytes:
     return buffer.getvalue()
 
 
+def _get_whisper_model():
+    global _WHISPER_MODEL
+    if _WHISPER_MODEL is not None:
+        return _WHISPER_MODEL
+    with _WHISPER_MODEL_LOCK:
+        if _WHISPER_MODEL is not None:
+            return _WHISPER_MODEL
+        try:
+            from faster_whisper import WhisperModel
+        except ImportError as exc:
+            raise RuntimeError(
+                "O reconhecimento local requer faster-whisper. "
+                "Instale as dependências com 'python -m pip install -r requirements.txt'."
+            ) from exc
+        options = {"device": "cpu", "compute_type": "int8"}
+        if STT_MODEL_DIR:
+            options["download_root"] = STT_MODEL_DIR
+        try:
+            _WHISPER_MODEL = WhisperModel(STT_MODEL, **options)
+        except Exception as exc:
+            logger.exception("Não foi possível carregar o modelo Whisper %s.", STT_MODEL)
+            raise RuntimeError(
+                f"Não foi possível carregar o modelo STT '{STT_MODEL}'. "
+                "Verifique a conexão para o download inicial ou o diretório de modelos."
+            ) from exc
+    return _WHISPER_MODEL
+
+
 def transcribe_audio_bytes(data: bytes, suffix: str = ".webm") -> str | None:
-    """Transcreve áudio (webm/ogg/wav) via ffmpeg + reconhecimento do Google."""
+    """Transcribes audio locally with faster-whisper in Portuguese."""
     if not data:
         return None
-    import tempfile
 
     handle, source = tempfile.mkstemp(suffix=suffix)
     os.close(handle)
-    wav_path = source + ".wav"
     try:
         with open(source, "wb") as file:
             file.write(data)
-        ffmpeg = shutil.which("ffmpeg")
-        if ffmpeg:
-            result = subprocess.run(
-                [ffmpeg, "-y", "-i", source, "-ar", "16000", "-ac", "1", wav_path],
-                capture_output=True,
-                timeout=60,
+        with _WHISPER_TRANSCRIBE_LOCK:
+            options = {
+                "language": "pt",
+                # beam maior melhora nomes próprios ("Jarvis"); o VAD do
+                # microfone já segmentou a fala, então não repetimos aqui.
+                "beam_size": 5,
+                "vad_filter": False,
+                "initial_prompt": (
+                    "Transcrição em português do Brasil. Palavras de ativação: "
+                    + ", ".join(sorted(WAKE_WORDS))
+                    + "."
+                ),
+            }
+            segments, _ = _get_whisper_model().transcribe(
+                source, **options
             )
-            if result.returncode != 0 or not os.path.exists(wav_path):
-                raise RuntimeError("ffmpeg não conseguiu converter o áudio.")
-            target = wav_path
-        else:
-            target = source
-        recognizer = sr.Recognizer()
-        with sr.AudioFile(target) as audio_file:
-            audio = recognizer.record(audio_file)
-        return recognizer.recognize_google(audio, language="pt-BR")
-    except sr.UnknownValueError:
-        return None
-    except (sr.RequestError, OSError, RuntimeError) as exc:
-        logger.warning("Falha ao transcrever áudio: %s", exc)
-        return None
+            text = " ".join(segment.text.strip() for segment in segments).strip()
+        return text or None
     finally:
-        for path in (source, wav_path):
-            try:
-                os.unlink(path)
-            except OSError:
-                pass
+        try:
+            os.unlink(source)
+        except OSError:
+            logger.warning("Não foi possível remover o áudio temporário: %s", source)
 
 
 def confirm_by_voice(description: str) -> bool | None:

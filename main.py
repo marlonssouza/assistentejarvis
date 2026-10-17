@@ -2,6 +2,7 @@ import argparse
 import asyncio
 import logging
 import platform
+import threading
 
 from google.genai.errors import APIError
 
@@ -12,9 +13,10 @@ from jarvis.config import (
     WAKE_DYNAMIC,
     WAKE_ENABLED,
     WAKE_WORDS,
-    get_gemini_api_key,
+    validate_provider_configuration,
 )
-from jarvis.voice import listen_for_wake_word, listen_microphone, speak_text
+from jarvis.logging_config import configure_logging
+from jarvis.voice import extract_wake_command, listen_microphone, speak_text
 
 logger = logging.getLogger(__name__)
 
@@ -40,12 +42,21 @@ def classify_command(query: str) -> str:
 
 async def _listen_for_query(state: dict[str, bool]) -> str | None:
     try:
-        return await asyncio.to_thread(listen_microphone)
+        return await _listen_microphone_cancellable()
     except RuntimeError as exc:
         logger.exception("Não foi possível obter um comando pelo microfone.")
         print(f"[Erro de entrada] {exc}")
         state["voice_disabled"] = True
         return None
+
+
+async def _listen_microphone_cancellable() -> str | None:
+    """Stop the microphone worker if its awaiting coroutine is cancelled."""
+    stop_event = threading.Event()
+    try:
+        return await asyncio.to_thread(listen_microphone, stop_event)
+    finally:
+        stop_event.set()
 
 
 async def _input_line(prompt: str) -> str | None:
@@ -56,14 +67,38 @@ async def _input_line(prompt: str) -> str | None:
 
 
 async def _answer(query: str) -> None:
+    loop = asyncio.get_running_loop()
+    sentence_queue = asyncio.Queue()
+    streamed_sentences = threading.Event()
+
+    async def speak_streamed_sentences() -> None:
+        while True:
+            sentence = await sentence_queue.get()
+            if sentence is None:
+                return
+            await speak_text(sentence)
+
+    speech_task = asyncio.create_task(speak_streamed_sentences())
+
+    def queue_sentence(sentence: str) -> None:
+        queued = asyncio.run_coroutine_threadsafe(sentence_queue.put(sentence), loop)
+        queued.result()
+        streamed_sentences.set()
+
     try:
-        response_text = await asyncio.to_thread(chat_with_vision, query, None)
+        response_text = await asyncio.to_thread(
+            chat_with_vision, query, None, queue_sentence
+        )
     except (APIError, OSError, RuntimeError, ValueError) as exc:
         logger.exception("Falha ao processar o pedido.")
         print(f"[Jarvis] Não foi possível processar o pedido: {exc}")
         return
+    finally:
+        await sentence_queue.put(None)
+        await speech_task
     print(f"\nJ.A.R.V.I.S.: {response_text}\n")
-    await speak_text(response_text)
+    if not streamed_sentences.is_set():
+        await speak_text(response_text)
 
 
 async def _next_query(system_os: str, state: dict[str, bool]) -> str | None:
@@ -73,7 +108,7 @@ async def _next_query(system_os: str, state: dict[str, bool]) -> str | None:
             f"\n[Aguardando] Diga uma palavra de ativação: {', '.join(WAKE_WORDS)}..."
         )
         try:
-            activated = await asyncio.to_thread(listen_for_wake_word, WAKE_WORDS)
+            utterance = await _listen_microphone_cancellable()
         except RuntimeError as exc:
             logger.exception("Falha ao ouvir a palavra de ativação.")
             print(f"[Erro de entrada] {exc}")
@@ -83,15 +118,20 @@ async def _next_query(system_os: str, state: dict[str, bool]) -> str | None:
                 "Verifique o microfone ou defina JARVIS_WAKE_ENABLED=false."
             )
         else:
-            if not activated:
+            if not utterance:
                 return None
+            query = extract_wake_command(utterance, WAKE_WORDS)
+            if query is None:
+                return None
+            if query:
+                return query
             wake_reply = "Sim?"
             if WAKE_DYNAMIC:
                 from jarvis.personality import get_wake_response
 
                 wake_reply = get_wake_response()
             await speak_text(wake_reply)
-            return await _listen_for_query(state)
+            return None
 
     line = await _input_line(f"\n[Comando para o Jarvis ({system_os})] >>> ")
     if line is None:
@@ -131,7 +171,7 @@ async def _standard_loop(system_os: str) -> None:
 
 async def main() -> None:
     try:
-        get_gemini_api_key()
+        validate_provider_configuration()
     except ConfigurationError as exc:
         logger.error("%s", exc)
         return
@@ -154,10 +194,7 @@ async def main() -> None:
 
 
 if __name__ == "__main__":
-    logging.basicConfig(
-        level=logging.INFO,
-        format="%(asctime)s %(levelname)s %(name)s: %(message)s",
-    )
+    configure_logging()
     parser = argparse.ArgumentParser(description="J.A.R.V.I.S. - assistente pessoal")
     parser.add_argument(
         "--ui",

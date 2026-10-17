@@ -1,18 +1,5 @@
-"""Abstração de provedores de LLM.
-
-O ``brain`` sempre falou com um objeto de chat que tem ``send_message(contents)``
-devolvendo algo com ``.text`` e ``.function_calls``. Aqui mantemos essa mesma
-interface para dois provedores:
-
-* ``gemini`` (padrão): o SDK ``google-genai``, como antes.
-* ``openai``: qualquer endpoint compatível com a API da OpenAI (OpenAI,
-  Ollama, LM Studio, OpenRouter, Groq...). Traduzimos o histórico e as
-  ferramentas para o formato OpenAI e devolvemos a resposta no mesmo formato que
-  o ``brain`` espera.
-
-Assim o restante do código não precisa saber qual provedor está ativo.
-"""
-
+"""Provedores de conversa: Ollama nativo local e Gemini opcional."""
+import asyncio
 import base64
 import json
 import logging
@@ -21,20 +8,12 @@ from types import SimpleNamespace
 import httpx
 
 from .config import (
-    MODEL_NAME,
-    OPENAI_API_KEY,
-    OPENAI_BASE_URL,
-    OPENAI_MODEL,
-    PROVIDER,
-    ZEN_API_KEY,
-    ZEN_BASE_URL,
-    ZEN_MODEL,
-    get_gemini_api_key,
+    MODEL_NAME, PROVIDER, get_gemini_api_key,
+    OLLAMA_BASE_URL, OLLAMA_MODEL, OLLAMA_TIMEOUT, OLLAMA_NUM_CTX,
+    OLLAMA_MAX_TOKENS, OLLAMA_NUM_BATCH, OLLAMA_KEEP_ALIVE,
 )
 
 logger = logging.getLogger(__name__)
-
-_REQUEST_TIMEOUT = 60.0
 
 _TYPE_NAMES = {
     "TYPE_UNSPECIFIED": "string",
@@ -49,6 +28,10 @@ _TYPE_NAMES = {
 
 class ProviderError(RuntimeError):
     """Erro ao falar com o provedor de LLM."""
+
+    def __init__(self, message, retry_after=None):
+        super().__init__(message)
+        self.retry_after = retry_after
 
 
 # --------------------------------------------------------------------- Gemini
@@ -82,9 +65,9 @@ def _create_gemini_chat(system_instruction: str, tools, history, model: str | No
     )
 
 
-# --------------------------------------------------- OpenAI-compatible format
+# ------------------------------------------------------ Formato das ferramentas
 def _schema_to_json(schema) -> dict:
-    """Converte um ``types.Schema`` (Gemini) em JSON Schema (OpenAI)."""
+    """Converte um ``types.Schema`` (Gemini) em JSON Schema (Ollama)."""
     if schema is None:
         return {"type": "object", "properties": {}}
     type_enum = getattr(schema, "type", None)
@@ -108,7 +91,7 @@ def _schema_to_json(schema) -> dict:
     return result
 
 
-def _tools_to_openai(tools) -> list[dict]:
+def _tools_to_ollama(tools) -> list[dict]:
     converted: list[dict] = []
     for tool in tools or []:
         for declaration in getattr(tool, "function_declarations", None) or []:
@@ -179,152 +162,224 @@ def _parts_to_message(parts) -> dict:
     return {"role": "user", "content": text_content}
 
 
-class OpenAIChat:
-    """Chat compatível com a interface usada pelo ``brain``."""
+class OllamaChat:
+    """Chat pela API nativa local do Ollama, com ferramentas do Jarvis."""
 
-    def __init__(
-        self,
-        system_instruction: str,
-        tools,
-        history,
-        model: str | None = None,
-        base_url: str | None = None,
-        api_key: str | None = None,
-    ) -> None:
-        self.base_url = (base_url if base_url is not None else OPENAI_BASE_URL).rstrip("/")
-        self.api_key = api_key if api_key is not None else OPENAI_API_KEY
-        if (
-            not self.api_key
-            and "localhost" not in self.base_url
-            and "127.0.0.1" not in self.base_url
-        ):
-            # Muitos servidores locais não exigem chave; para provedores remotos
-            # uma chave é necessária.
-            logger.warning(
-                "Nenhuma chave de API definida para %s; o provedor pode recusar a requisição.",
-                self.base_url,
-            )
-        self.model = model or OPENAI_MODEL
-        self.tools = _tools_to_openai(tools)
-        self._messages: list[dict] = []
+    def __init__(self, system_instruction, tools, history, model=None):
+        self.model = model or OLLAMA_MODEL
+        self.tools = _tools_to_ollama(tools)
+        self._messages = []
         if system_instruction:
             self._messages.append({"role": "system", "content": system_instruction})
         self._messages.extend(_history_to_messages(history))
-        self._pending_tool_ids: list[tuple[str, str]] = []
 
-    # ------------------------------------------------------------- transporte
-    def _post(self, payload: dict) -> dict:
-        headers = {"Content-Type": "application/json"}
-        if self.api_key:
-            headers["Authorization"] = f"Bearer {self.api_key}"
-        url = f"{self.base_url}/chat/completions"
+    def _stream(self, payload):
+        """Fecha a conexão de geração assim que um turno é interrompido."""
+        from . import security
+        content, calls = [], []
         try:
-            response = httpx.post(url, headers=headers, json=payload, timeout=_REQUEST_TIMEOUT)
-            response.raise_for_status()
+            with httpx.stream("POST", f"{OLLAMA_BASE_URL}/api/chat",
+                              json=dict(payload, stream=True),
+                              timeout=httpx.Timeout(OLLAMA_TIMEOUT, connect=5)) as response:
+                response.raise_for_status()
+                for line in response.iter_lines():
+                    security.check_cancelled()
+                    if not line:
+                        continue
+                    part = json.loads(line)
+                    if part.get("error"):
+                        raise ProviderError(f"Erro do Ollama: {part['error']}")
+                    message = part.get("message") or {}
+                    content.append(message.get("content") or "")
+                    calls.extend(message.get("tool_calls") or [])
+                    if part.get("done"):
+                        break
         except httpx.HTTPStatusError as exc:
-            detail = exc.response.text[:500] if exc.response is not None else ""
-            raise ProviderError(f"Provedor retornou {exc.response.status_code}: {detail}") from exc
+            security.check_cancelled()
+            raise ProviderError(f"Ollama retornou {exc.response.status_code}") from exc
         except httpx.HTTPError as exc:
-            raise ProviderError(f"Falha ao contatar o provedor: {exc}") from exc
-        try:
-            return response.json()
+            raise ProviderError(f"Falha ao contatar o Ollama: {exc}") from exc
         except ValueError as exc:
-            raise ProviderError("O provedor retornou uma resposta inválida (não-JSON).") from exc
+            raise ProviderError("O Ollama retornou JSON de transmissão inválido.") from exc
+        security.check_cancelled()
+        return {"message":{"role":"assistant","content":"".join(content),"tool_calls":calls}}
 
-    def _take_tool_id(self, name: str) -> str | None:
-        for index, (pending_name, tool_id) in enumerate(self._pending_tool_ids):
-            if pending_name == name:
-                self._pending_tool_ids.pop(index)
-                return tool_id
-        return None
+    def _post(self, payload):
+        return self._stream(payload)
 
-    # --------------------------------------------------------------- interface
-    def send_message(self, contents) -> SimpleNamespace:
-        parts = list(contents) if contents is not None else []
+    def _append_contents(self, contents) -> None:
+        parts = list(contents or [])
         first = parts[0] if parts else None
         if first is not None and getattr(first, "function_response", None) is not None:
             for part in parts:
-                response = getattr(part, "function_response", None)
-                if response is None:
-                    continue
-                name = getattr(response, "name", "")
-                payload = getattr(response, "response", {})
-                tool_id = self._take_tool_id(name)
-                self._messages.append(
-                    {
-                        "role": "tool",
-                        "tool_call_id": tool_id or name,
-                        "name": name,
-                        "content": _stringify(payload),
-                    }
-                )
-        else:
-            self._messages.append(_parts_to_message(parts))
+                result = getattr(part, "function_response", None)
+                if result is not None:
+                    self._messages.append({
+                        "role": "tool", "tool_name": result.name,
+                        "content": _stringify(result.response),
+                    })
+            return
 
-        payload = {"model": self.model, "messages": self._messages}
+        message = _parts_to_message(parts)
+        if isinstance(message["content"], list):
+            raise ValueError(
+                "Os modelos locais configurados não suportam imagens. "
+                "Use um modelo com visão para analisar capturas."
+            )
+        self._messages.append(message)
+
+    def _payload(self) -> dict:
+        payload = {
+            "model": self.model, "messages": list(self._messages), "stream": True,
+            "keep_alive": OLLAMA_KEEP_ALIVE,
+            "options": {"num_ctx": OLLAMA_NUM_CTX, "num_predict": OLLAMA_MAX_TOKENS,
+                        "num_batch": OLLAMA_NUM_BATCH, "temperature": 0.2},
+        }
         if self.tools:
             payload["tools"] = self.tools
-            payload["tool_choice"] = "auto"
+        return payload
 
-        data = self._post(payload)
-        if not data.get("choices"):
-            raise ProviderError("O provedor não retornou escolhas (choices).")
-        message = data["choices"][0].get("message", {}) or {}
-
+    def _normalize_message(self, message: dict, text: str | None = None):
+        response_text = text if text is not None else message.get("content") or ""
+        if not isinstance(response_text, str):
+            raise ProviderError("O Ollama retornou conteúdo inválido.")
         raw_calls = message.get("tool_calls") or []
-        function_calls = []
-        self._pending_tool_ids = []
-        assistant_message: dict = {"role": "assistant", "content": message.get("content") or ""}
-        if raw_calls:
-            serialized_calls = []
-            for call in raw_calls:
-                function = call.get("function", {}) or {}
-                name = function.get("name", "")
-                raw_args = function.get("arguments") or "{}"
+        if not isinstance(raw_calls, list):
+            raise ProviderError("O Ollama retornou chamadas de ferramenta inválidas.")
+        allowed = {tool["function"]["name"] for tool in self.tools}
+        calls = []
+        normalized = []
+        for call in raw_calls:
+            function = call.get("function") if isinstance(call, dict) else None
+            if not isinstance(function, dict) or function.get("name") not in allowed:
+                raise ProviderError("O Ollama solicitou uma ferramenta não declarada.")
+            args = function.get("arguments", {})
+            if isinstance(args, str):
                 try:
-                    args = json.loads(raw_args) if isinstance(raw_args, str) else (raw_args or {})
-                except (TypeError, ValueError):
-                    args = {}
-                if not isinstance(args, dict):
-                    args = {}
-                call_id = call.get("id") or name
-                self._pending_tool_ids.append((name, call_id))
-                function_calls.append(SimpleNamespace(name=name, args=args))
-                serialized_calls.append(
-                    {
-                        "id": call_id,
-                        "type": "function",
-                        "function": {"name": name, "arguments": _stringify(args)},
-                    }
-                )
-            assistant_message["tool_calls"] = serialized_calls
-        self._messages.append(assistant_message)
+                    args = json.loads(args)
+                except ValueError as exc:
+                    raise ProviderError(
+                        "O Ollama retornou argumentos de ferramenta inválidos."
+                    ) from exc
+            if not isinstance(args, dict):
+                raise ProviderError("O Ollama retornou argumentos de ferramenta inválidos.")
+            calls.append(SimpleNamespace(name=function["name"], args=args))
+            normalized.append({"function": {"name": function["name"], "arguments": args}})
+        if not response_text and not calls:
+            raise ProviderError("O Ollama retornou uma resposta vazia.")
+        assistant = {"role": "assistant", "content": response_text}
+        if normalized:
+            assistant["tool_calls"] = normalized
+        self._messages.append(assistant)
+        return SimpleNamespace(text=response_text, function_calls=calls)
 
-        return SimpleNamespace(text=message.get("content"), function_calls=function_calls)
+    async def stream_message(self, contents):
+        """Gera atualizações de texto assíncronas e, por fim, a resposta completa."""
+        from . import security
+
+        self._append_contents(contents)
+        payload = self._payload()
+        content: list[str] = []
+        calls: list[dict] = []
+        timeout = httpx.Timeout(OLLAMA_TIMEOUT, connect=5)
+        try:
+            async with httpx.AsyncClient(timeout=timeout) as client:
+                async with client.stream(
+                    "POST", f"{OLLAMA_BASE_URL}/api/chat", json=payload
+                ) as response:
+                    loop = asyncio.get_running_loop()
+
+                    def close_stream() -> None:
+                        def schedule_close() -> None:
+                            task = asyncio.create_task(response.aclose())
+                            task.add_done_callback(
+                                lambda completed: (
+                                    logger.debug(
+                                        "Falha ao fechar o stream Ollama cancelado.",
+                                        exc_info=completed.exception(),
+                                    )
+                                    if not completed.cancelled()
+                                    and completed.exception() is not None
+                                    else None
+                                )
+                            )
+
+                        loop.call_soon_threadsafe(schedule_close)
+
+                    unregister_cancel = security.register_cancel_callback(close_stream)
+                    try:
+                        response.raise_for_status()
+                        async for line in response.aiter_lines():
+                            security.check_cancelled()
+                            if not line:
+                                continue
+                            try:
+                                part = json.loads(line)
+                            except ValueError as exc:
+                                raise ProviderError(
+                                    "O Ollama retornou JSON de transmissão inválido."
+                                ) from exc
+                            if part.get("error"):
+                                raise ProviderError(f"Erro do Ollama: {part['error']}")
+                            message = part.get("message") or {}
+                            if not isinstance(message, dict):
+                                raise ProviderError("O Ollama retornou uma mensagem inválida.")
+                            delta = message.get("content") or ""
+                            if not isinstance(delta, str):
+                                raise ProviderError("O Ollama retornou conteúdo inválido.")
+                            if delta:
+                                content.append(delta)
+                                yield SimpleNamespace(text_delta=delta, response=None)
+                            calls.extend(message.get("tool_calls") or [])
+                            if part.get("done"):
+                                break
+                    finally:
+                        unregister_cancel()
+        except httpx.HTTPStatusError as exc:
+            security.check_cancelled()
+            raise ProviderError(f"Ollama retornou {exc.response.status_code}") from exc
+        except httpx.HTTPError as exc:
+            security.check_cancelled()
+            raise ProviderError(f"Falha ao contatar o Ollama: {exc}") from exc
+        except Exception:
+            security.check_cancelled()
+            raise
+
+        security.check_cancelled()
+        final_message = {"content": "".join(content), "tool_calls": calls}
+        yield SimpleNamespace(
+            text_delta="",
+            response=self._normalize_message(final_message, "".join(content)),
+        )
+
+    def send_message(self, contents):
+        self._append_contents(contents)
+        data = self._post(self._payload())
+        message = data.get("message")
+        if not isinstance(message, dict):
+            raise ProviderError("O Ollama não retornou uma mensagem de resposta.")
+        return self._normalize_message(message)
+
+
+def release_target(target):
+    """Libera apenas o modelo local que falhou antes de tentar o seguinte."""
+    if target.kind != "ollama":
+        return
+    try:
+        httpx.post(f"{OLLAMA_BASE_URL}/api/generate", json={
+            "model": target.model or OLLAMA_MODEL, "keep_alive": 0,
+        }, timeout=5)
+    except httpx.HTTPError:
+        logger.debug("Não foi possível liberar o modelo local após a falha.")
 
 
 def create_chat(system_instruction: str, tools, history, target=None):
-    """Cria um chat no alvo indicado (ou no provedor ativo), com a interface do Gemini."""
     kind = getattr(target, "kind", None) or PROVIDER
     model = getattr(target, "model", None)
-    if kind == "zen":
-        return OpenAIChat(
-            system_instruction=system_instruction,
-            tools=tools,
-            history=history,
-            model=model or ZEN_MODEL,
-            base_url=ZEN_BASE_URL,
-            api_key=ZEN_API_KEY,
-        )
-    if kind == "openai":
-        return OpenAIChat(
-            system_instruction=system_instruction,
-            tools=tools,
-            history=history,
-            model=model,
-            base_url=OPENAI_BASE_URL,
-            api_key=OPENAI_API_KEY,
-        )
-    if model:
-        return _create_gemini_chat(system_instruction, tools, history, model=model)
-    return _create_gemini_chat(system_instruction, tools, history)
+    if kind == "ollama":
+        return OllamaChat(system_instruction, tools, history, model=model)
+    if kind == "gemini":
+        if model:
+            return _create_gemini_chat(system_instruction, tools, history, model=model)
+        return _create_gemini_chat(system_instruction, tools, history)
+    raise ProviderError(f"Provedor não suportado: {kind}")

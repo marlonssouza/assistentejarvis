@@ -94,6 +94,49 @@ class BrainTests(unittest.TestCase):
         self.assertEqual(len(chat.messages), 2)
         self.assertIsNotNone(chat.messages[1][0].function_response)
 
+    def test_ollama_stream_emits_complete_sentences_before_final_reply(self):
+        class StreamingChat:
+            async def stream_message(self, _contents):
+                yield SimpleNamespace(text_delta="Primeira frase.")
+                yield SimpleNamespace(text_delta=" Segunda frase!")
+                yield SimpleNamespace(
+                    text_delta="",
+                    response=SimpleNamespace(
+                        text="Primeira frase. Segunda frase!", function_calls=[]
+                    ),
+                )
+
+        sentences = []
+        with patch.object(brain, "_new_chat", return_value=StreamingChat()):
+            result = brain.chat_with_vision("Responda em duas frases.", on_sentence=sentences.append)
+
+        self.assertEqual(result, "Primeira frase. Segunda frase!")
+        self.assertEqual(sentences, ["Primeira frase.", "Segunda frase!"])
+
+    def test_streamed_sentence_prevents_failover_retry(self):
+        class FailingStream:
+            async def stream_message(self, _contents):
+                yield SimpleNamespace(text_delta="Primeira frase.")
+                raise brain.providers.ProviderError("429 quota exceeded")
+
+        targets = []
+        def factory(prompt="", target=None):
+            targets.append(target)
+            return FailingStream()
+
+        with (
+            patch.object(brain.failover, "candidates", return_value=[
+                brain.failover.Target("ollama", "qwen2.5:7b"),
+                brain.failover.Target("ollama", "llama3.1:8b"),
+            ]),
+            patch.object(brain, "_new_chat", side_effect=factory),
+            patch.object(brain.failover, "mark_exhausted"),
+        ):
+            with self.assertRaises(brain.providers.ProviderError):
+                brain.chat_with_vision("Oi", on_sentence=lambda _sentence: None)
+
+        self.assertEqual(len(targets), 1)
+
     def test_capture_screen_image_is_sent_back_to_the_model(self):
         function_call = SimpleNamespace(name="capture_screen", args={})
         chat = FakeChat(
@@ -144,6 +187,20 @@ class BrainTests(unittest.TestCase):
         self.assertIn("PERFIL X", text)
         self.assertIn("FATOS Y", text)
         self.assertIn("POLITICAS Z", text)
+
+    def test_prioritized_persona_starts_system_instruction(self):
+        with (
+            patch.object(brain.persona, "persona_block", return_value="PERFIL X"),
+            patch.object(brain.persona, "relevant_facts_block", return_value=""),
+            patch.object(brain.policies, "policies_block", return_value=""),
+        ):
+            text = brain.build_system_instruction("oi")
+
+        self.assertTrue(text.startswith("PERSONA PRIORITÁRIA:"))
+        self.assertIn("dirija-se ao usuário como 'Senhor'", text)
+        self.assertIn("ironia fina, sarcasmo sutil e humor seco", text)
+        self.assertIn("executado localmente com Ollama", text)
+        self.assertLess(text.index("PERSONA PRIORITÁRIA:"), text.index("Você é o J.A.R.V.I.S."))
 
     def test_system_instruction_survives_context_failures(self):
         with patch.object(brain.persona, "persona_block", side_effect=RuntimeError("boom")):
@@ -257,6 +314,9 @@ class FailoverTurnTests(unittest.TestCase):
     """O turno deve migrar para o próximo alvo quando um provedor estoura a cota."""
 
     def setUp(self):
+        release_patch = patch.object(brain.providers, "release_target")
+        release_patch.start()
+        self.addCleanup(release_patch.stop)
         memory.reset_store()
         self._tmp = tempfile.TemporaryDirectory()
         self.addCleanup(self._tmp.cleanup)
@@ -281,22 +341,52 @@ class FailoverTurnTests(unittest.TestCase):
             return {}
         return json.loads(failover.STATE_FILE.read_text(encoding="utf-8"))
 
+    def test_local_chain_releases_failed_qwen_then_uses_llama(self):
+        seen = []
+        def factory(prompt="", target=None):
+            seen.append(target.model)
+            if target.model == "qwen2.5:7b-instruct-q4_K_M":
+                return QuotaChat(ProviderError("Falha ao contatar o Ollama: timed out"))
+            return FakeChat(SimpleNamespace(function_calls=None, text="Resposta local do Llama"))
+        with (
+            patch.object(config, "PROVIDER_CHAIN", ("ollama:qwen2.5:7b-instruct-q4_K_M", "ollama:llama3.1:8b")),
+            patch.object(brain, "_new_chat", side_effect=factory),
+            patch.object(brain.providers, "release_target") as release,
+        ):
+            self.assertEqual(brain.chat_with_vision("Oi"), "Resposta local do Llama")
+        self.assertEqual(seen, ["qwen2.5:7b-instruct-q4_K_M", "llama3.1:8b"])
+        release.assert_called_once_with(failover.Target("ollama", "qwen2.5:7b-instruct-q4_K_M"))
+
+    def test_creation_error_advances_before_any_tool_runs(self):
+        def factory(prompt="", target=None):
+            if target.kind == "ollama":
+                raise ProviderError("Ollama retornou 503: indisponível")
+            return FakeChat(SimpleNamespace(function_calls=None, text="fallback ok"))
+        with (
+            patch.object(config, "PROVIDER_CHAIN", ("ollama", "gemini")),
+            patch.object(brain, "_new_chat", side_effect=factory),
+            patch.object(brain, "execute_tool") as execute,
+        ):
+            self.assertEqual(brain.chat_with_vision("Oi"), "fallback ok")
+        execute.assert_not_called()
+        self.assertIn("ollama", self._state())
+
     def test_quota_error_advances_to_next_target(self):
         quota = ProviderError("Provedor retornou 429: RESOURCE_EXHAUSTED quota exceeded")
 
         def build_chat(prompt="", target=None):
-            if target.kind == "zen":
+            if target.kind == "ollama":
                 return QuotaChat(quota)
             return FakeChat(SimpleNamespace(function_calls=None, text="Resposta do Gemini"))
 
         with (
-            patch.object(config, "PROVIDER_CHAIN", ("zen:qwen3.6-plus-free", "gemini")),
+            patch.object(config, "PROVIDER_CHAIN", ("ollama:qwen2.5:7b-instruct-q4_K_M", "gemini")),
             patch.object(brain, "_new_chat", side_effect=build_chat),
         ):
             result = brain.chat_with_vision("Oi")
 
         self.assertEqual(result, "Resposta do Gemini")
-        self.assertIn("zen:qwen3.6-plus-free", self._state())
+        self.assertIn("ollama:qwen2.5:7b-instruct-q4_K_M", self._state())
 
     def test_plan_approval_is_not_requested_again_on_failover(self):
         function_call = SimpleNamespace(
@@ -306,7 +396,7 @@ class FailoverTurnTests(unittest.TestCase):
         pre_approved_seen = []
 
         def build_chat(prompt="", target=None):
-            if target.kind == "zen":
+            if target.kind == "ollama":
                 return QuotaChat(quota)
             return FakeChat(
                 SimpleNamespace(function_calls=[function_call], text=None),
@@ -317,7 +407,7 @@ class FailoverTurnTests(unittest.TestCase):
             patch.object(brain.plan, "PLAN_MODE", True),
             patch.object(brain, "_draft_plan", return_value="1. Abrir a calculadora"),
             patch.object(brain.security, "confirm_action", return_value=True) as confirm,
-            patch.object(config, "PROVIDER_CHAIN", ("zen", "gemini")),
+            patch.object(config, "PROVIDER_CHAIN", ("ollama", "gemini")),
             patch.object(brain, "_new_chat", side_effect=build_chat),
             patch.object(
                 brain,
@@ -353,7 +443,7 @@ class FailoverTurnTests(unittest.TestCase):
                 raise quota
 
         with (
-            patch.object(config, "PROVIDER_CHAIN", ("zen", "gemini")),
+            patch.object(config, "PROVIDER_CHAIN", ("ollama", "gemini")),
             patch.object(
                 brain, "_new_chat", side_effect=lambda prompt="", target=None: MidTurnQuotaChat()
             ),
@@ -364,13 +454,13 @@ class FailoverTurnTests(unittest.TestCase):
 
         # A ferramenta rodou uma única vez (o turno não foi repetido).
         self.assertEqual(run_tool.call_count, 1)
-        self.assertIn("zen", self._state())
+        self.assertIn("ollama", self._state())
 
     def test_non_quota_error_is_not_hidden_by_failover(self):
         boom = RuntimeError("bug de verdade")
 
         with (
-            patch.object(config, "PROVIDER_CHAIN", ("zen", "gemini")),
+            patch.object(config, "PROVIDER_CHAIN", ("ollama", "gemini")),
             patch.object(brain, "_new_chat", side_effect=lambda prompt="", target=None: QuotaChat(boom)),
         ):
             with self.assertRaises(RuntimeError) as ctx:
@@ -383,7 +473,7 @@ class FailoverTurnTests(unittest.TestCase):
         quota = ProviderError("Provedor retornou 429: quota exceeded")
 
         with (
-            patch.object(config, "PROVIDER_CHAIN", ("zen", "gemini")),
+            patch.object(config, "PROVIDER_CHAIN", ("ollama", "gemini")),
             patch.object(brain, "_new_chat", side_effect=lambda prompt="", target=None: QuotaChat(quota)),
         ):
             with self.assertRaises(RuntimeError) as ctx:
@@ -395,9 +485,9 @@ class FailoverTurnTests(unittest.TestCase):
 
     def test_successful_turn_recovers_exhausted_target(self):
         """Se um alvo esgotado volta a responder, ele é liberado na hora."""
-        with patch.object(config, "PROVIDER_CHAIN", ("zen",)):
-            failover.mark_exhausted(failover.Target("zen"), seconds=3600)
-            self.assertEqual(self._state().get("zen", 0) > 0, True)
+        with patch.object(config, "PROVIDER_CHAIN", ("ollama",)):
+            failover.mark_exhausted(failover.Target("ollama"), seconds=3600)
+            self.assertEqual(self._state().get("ollama", 0) > 0, True)
             with patch.object(
                 brain,
                 "_new_chat",
@@ -408,7 +498,7 @@ class FailoverTurnTests(unittest.TestCase):
                 result = brain.chat_with_vision("Oi")
 
         self.assertEqual(result, "ok")
-        self.assertNotIn("zen", self._state())
+        self.assertNotIn("ollama", self._state())
 
 
 if __name__ == "__main__":

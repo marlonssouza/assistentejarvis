@@ -208,14 +208,23 @@
       <div class="topbar">
         <div class="title">Centro de comando</div>
         <div class="actions">
+          <select id="speechMode" aria-label="Modo de voz" style="padding:8px;border-radius:8px;background:#172237;color:#eef;border:1px solid #456">
+            <option value="browser">Voz do navegador</option><option value="server">Voz online</option><option value="none">Som desligado</option>
+          </select>
+          <button class="btn small" id="cameraBtn" aria-pressed="false">Ligar câmera</button>
+          <button class="btn small" id="interruptBtn">Interromper</button>
           <button class="btn small" id="resetBtn">Limpar conversa</button>
         </div>
       </div>
 
+      <div id="cameraPanel" hidden style="padding:8px 20px">
+        <video id="cameraVideo" autoplay muted playsinline style="width:220px;max-width:100%;border-radius:12px;transform:scaleX(-1)"></video>
+        <p style="font-size:12px">Prévia local. O Jarvis ainda não recebe nem analisa imagens.</p>
+      </div>
       <div class="chat" id="chat">
         <div class="msg empty">
           <h2>Olá! Eu sou o J.A.R.V.I.S.</h2>
-          <p>Clique no microfone e fale (ele detecta o fim da frase sozinho), ou escreva abaixo.<br>
+          <p>Clique no microfone e fale (você pode interromper a resposta falando ou pelo botão), ou escreva abaixo.<br>
           Exemplos: &ldquo;Abra o Chrome&rdquo;, &ldquo;Veja meus e-mails mais recentes&rdquo;, &ldquo;Pesquise o preço do dólar hoje&rdquo;.</p>
         </div>
       </div>
@@ -321,25 +330,80 @@
     });
   }
 
-  // ---------- Audio playback ----------
-  var audioQueue = [];
-  var playingAudio = false;
+  // ---------- Conversa e reprodução com interrupção ----------
+  var audioQueue = [], playingAudio = false, currentAudio = null;
+  var playbackVersion = 0, activeTurn = 0, acceptAudio = true;
+  var speechMode = localStorage.getItem("jarvis_speech_mode") || "browser";
+  $("speechMode").value = speechMode;
+
+  function stopPlayback() {
+    playbackVersion++;
+    audioQueue = [];
+    if (currentAudio) {
+      currentAudio.onended = currentAudio.onerror = null;
+      currentAudio.pause(); currentAudio.src = ""; currentAudio = null;
+    }
+    if (window.speechSynthesis) window.speechSynthesis.cancel();
+    playingAudio = false;
+  }
+  function interrupt() {
+    stopPlayback(); acceptAudio = false;
+    currentConfirm = null; overlay.classList.remove("show");
+    sendObj({type:"ABORT"});
+    setState(listening ? "listening" : "idle");
+    hintEl.textContent = listening ? "Estou ouvindo. Pode continuar." : "Resposta interrompida.";
+  }
+  $("interruptBtn").addEventListener("click", interrupt);
+  document.addEventListener("keydown", function(e) { if (e.key === "Escape") interrupt(); });
+  $("speechMode").addEventListener("change", function() {
+    stopPlayback(); speechMode = this.value;
+    localStorage.setItem("jarvis_speech_mode", speechMode);
+    sendObj({type:"preferences",speech_mode:speechMode});
+    setState(listening ? "listening" : "idle");
+  });
+
   function enqueueAudio(url) {
+    if (!acceptAudio) return;
     audioQueue.push(url);
     if (!playingAudio) playNextAudio();
   }
   function playNextAudio() {
-    if (audioQueue.length === 0) {
-      playingAudio = false;
-      if (state === "speaking") setState("idle");
+    if (!audioQueue.length) {
+      currentAudio = null; playingAudio = false;
+      setState(listening ? "listening" : "idle");
       return;
     }
-    playingAudio = true;
-    var audio = new Audio(audioQueue.shift());
-    audio.onended = playNextAudio;
-    audio.onerror = playNextAudio;
-    audio.play().catch(function () { setTimeout(playNextAudio, 120); });
+    var version = playbackVersion;
+    playingAudio = true; setState("speaking");
+    currentAudio = new Audio(audioQueue.shift());
+    var next = function() { if (version === playbackVersion) playNextAudio(); };
+    currentAudio.onended = currentAudio.onerror = next;
+    currentAudio.play().catch(next);
   }
+  function speakBrowser(text) {
+    if (speechMode !== "browser" || !acceptAudio) return;
+    if (!window.speechSynthesis || !window.SpeechSynthesisUtterance) {
+      addActivity("Voz do navegador indisponível. Selecione Voz online ou use texto.");
+      setState(listening ? "listening" : "idle"); return;
+    }
+    stopPlayback();
+    var version = playbackVersion;
+    // Não ler marcação de código/imagens como se fossem fala.
+    text = text.replace(/```[\s\S]*?```/g, "Trecho de código disponível no texto.")
+      .replace(/!\[[^\]]*\]\([^)]*\)/g, "").replace(/[*#`]/g, "").slice(0,1800);
+    var utterance = new SpeechSynthesisUtterance(text);
+    utterance.lang = "pt-BR"; utterance.rate = 1.04;
+    var voices = window.speechSynthesis.getVoices().filter(function(v) { return /^pt[-_]BR/i.test(v.lang); });
+    utterance.voice = voices.find(function(v) { return /natural|neural/i.test(v.name); }) || voices[0] || null;
+    utterance.onend = utterance.onerror = function() {
+      if (version !== playbackVersion) return;
+      playingAudio = false; setState(listening ? "listening" : "idle");
+      hintEl.textContent = listening ? "Pode falar naturalmente. Escape ou Interromper para parar." : "Microfone desligado";
+    };
+    playingAudio = true; setState("speaking");
+    window.speechSynthesis.speak(utterance);
+  }
+
 
   // ---------- Token Auth & WebSocket ----------
   function getToken() {
@@ -365,8 +429,9 @@
     var token = getToken();
     var query = token ? "?token=" + encodeURIComponent(token) : "";
     ws = new WebSocket(proto + "://" + location.host + "/ws" + query);
-    ws.onopen = function () { connEl.classList.remove("show"); };
+    ws.onopen = function () { activeTurn = 0; connEl.classList.remove("show"); sendObj({type:"preferences",speech_mode:speechMode}); };
     ws.onclose = function (ev) {
+      stopPlayback();
       connEl.classList.add("show");
       if (ev.code === 1008) {
         promptToken("Acesso protegido: informe o token configurado em JARVIS_UI_TOKEN.");
@@ -384,25 +449,39 @@
   }
 
   function handle(event) {
+    if (typeof event.turn_id === "number") {
+      if (event.turn_id < activeTurn) return;
+      activeTurn = event.turn_id;
+    }
     switch (event.type) {
       case "ready":
         renderSkills(event.skills);
         setState("idle");
         break;
+      case "interrupted":
+        stopPlayback(); acceptAudio = false;
+        overlay.classList.remove("show"); currentConfirm = null;
+        setState(listening ? "listening" : "idle"); break;
       case "status":
+        if (event.state === "idle" && playingAudio) break;
         setState(event.state);
         break;
       case "user":
+        acceptAudio = true;
         addMessage("user", event.text, "Você");
         break;
       case "transcript":
         addActivity("🎤 ouvi: <b>" + esc(event.text) + "</b>");
         break;
       case "assistant":
-        setState("speaking");
+        if (!acceptAudio) break;
         addMessage("assistant", event.text, "Jarvis");
+        if (speechMode === "browser") speakBrowser(event.text);
+        else if (speechMode === "server") setState("speaking");
+        else setState(listening ? "listening" : "idle");
         break;
       case "audio":
+        if (!acceptAudio) break;
         enqueueAudio("data:audio/" + (event.format || "mp3") + ";base64," + event.data);
         break;
       case "tool_start":
@@ -439,6 +518,8 @@
       addMessage("error", "Sem conexão com o servidor. Aguarde alguns segundos.");
       return;
     }
+    if (busy || playingAudio) interrupt();
+    acceptAudio = true;
     sendObj({ type: "user_text", text: text });
   }
 
@@ -485,134 +566,141 @@
     });
   }
 
-  // ---------- Microphone (push-to-talk com detecção de silêncio) ----------
-  var mediaStream = null;
-  var audioCtx = null;
-  var analyser = null;
-  var timeData = null;
-  var recorder = null;
-  var chunks = [];
-  var listening = false;
-  var recording = false;
-  var lastVoice = 0;
-  var rafId = null;
-  var mimeType = "";
+  // ---------- Microfone com cancelamento de eco e detecção de interrupção ----------
+  var mediaStream = null, audioCtx = null, analyser = null, timeData = null;
+  var listening = false, recording = false;
+  var lastVoice = 0, rafId = null, mimeType = "";
+  var noiseFloor = 0.008;
+  // Gravação contínua em blocos: preserva o ataque da palavra de ativação,
+  // que antes era cortado por só iniciar a gravação após detectar fala.
+  var rollingRecorder = null, rollingChunks = [], captureFrom = null, flushPending = false;
+  var ROLLING_SLICE_MS = 250, PRE_ROLL_CHUNKS = 2, MAX_ROLLING_CHUNKS = 80;
+  var utteranceStart = 0, MAX_UTTERANCE_MS = 15000;
 
   function pickMime() {
-    var options = ["audio/webm;codecs=opus", "audio/webm", "audio/ogg;codecs=opus", "audio/ogg"];
-    for (var i = 0; i < options.length; i++) {
-      if (window.MediaRecorder && MediaRecorder.isTypeSupported(options[i])) return options[i];
-    }
-    return "";
+    var options = ["audio/webm;codecs=opus","audio/webm","audio/ogg;codecs=opus","audio/ogg"];
+    return options.find(function(type) { return window.MediaRecorder && MediaRecorder.isTypeSupported(type); }) || "";
   }
-  function suffixFor(mime) {
-    if (mime.indexOf("ogg") !== -1) return ".ogg";
-    if (mime.indexOf("mp4") !== -1) return ".mp4";
-    return ".webm";
-  }
-
+  function suffixFor(mime) { return mime.indexOf("ogg") !== -1 ? ".ogg" : ".webm"; }
   async function ensureMic() {
     if (mediaStream) return true;
-    if (!navigator.mediaDevices || !navigator.mediaDevices.getUserMedia) {
-      addMessage("error", "Este navegador não permite capturar o microfone. Use a caixa de texto.");
-      return false;
-    }
     try {
-      mediaStream = await navigator.mediaDevices.getUserMedia({ audio: true });
+      mediaStream = await navigator.mediaDevices.getUserMedia({audio:{
+        echoCancellation:true, noiseSuppression:true, autoGainControl:true
+      }});
       audioCtx = new (window.AudioContext || window.webkitAudioContext)();
-      var source = audioCtx.createMediaStreamSource(mediaStream);
-      analyser = audioCtx.createAnalyser();
-      analyser.fftSize = 1024;
-      source.connect(analyser);
-      timeData = new Uint8Array(analyser.fftSize);
-      mimeType = pickMime();
+      await audioCtx.resume();
+      analyser = audioCtx.createAnalyser(); analyser.fftSize = 1024;
+      audioCtx.createMediaStreamSource(mediaStream).connect(analyser);
+      timeData = new Uint8Array(analyser.fftSize); mimeType = pickMime();
       return true;
     } catch (err) {
-      addMessage("error", "Não consegui acessar o microfone: " + err.message);
-      return false;
+      if (mediaStream) mediaStream.getTracks().forEach(function(t) { t.stop(); });
+      mediaStream = null;
+      addMessage("error","Não consegui acessar o microfone: " + err.message); return false;
     }
   }
-
-  function startRecording() {
-    if (recording || !mediaStream) return;
-    chunks = [];
-    try {
-      recorder = mimeType ? new MediaRecorder(mediaStream, { mimeType: mimeType }) : new MediaRecorder(mediaStream);
-    } catch (err) {
-      addMessage("error", "Falha ao iniciar a gravação: " + err.message);
-      return;
-    }
-    recorder.ondataavailable = function (e) { if (e.data && e.data.size) chunks.push(e.data); };
-    recorder.onstop = function () {
-      var blob = new Blob(chunks, { type: mimeType || "audio/webm" });
-      chunks = [];
-      if (blob.size < 800) return;
-      blobToBase64(blob).then(function (data) {
-        sendObj({ type: "audio", data: data, suffix: suffixFor(mimeType) });
-      });
+  function beginRolling() {
+    if (rollingRecorder || !mediaStream) return;
+    try { rollingRecorder = mimeType ? new MediaRecorder(mediaStream,{mimeType:mimeType}) : new MediaRecorder(mediaStream); }
+    catch (err) { addMessage("error","Falha no microfone: " + err.message); return; }
+    rollingChunks = []; captureFrom = null; flushPending = false;
+    rollingRecorder.ondataavailable = function(e) {
+      if (e.data && e.data.size) rollingChunks.push({t:performance.now(), blob:e.data});
+      if (rollingChunks.length > MAX_ROLLING_CHUNKS) {
+        var drop = rollingChunks.length - MAX_ROLLING_CHUNKS;
+        rollingChunks.splice(0, drop);
+        if (captureFrom !== null) captureFrom = Math.max(0, captureFrom - drop);
+      }
+      if (flushPending) {
+        flushPending = false;
+        var from = captureFrom === null ? 0 : captureFrom;
+        var pieces = rollingChunks.slice(from).map(function(c) { return c.blob; });
+        rollingChunks = []; captureFrom = null;
+        sendSegment(pieces);
+      }
     };
-    recorder.start();
-    recording = true;
-    setState("listening");
-    hintEl.textContent = "Gravando… fale agora";
+    try { rollingRecorder.start(ROLLING_SLICE_MS); } catch (err) { rollingRecorder = null; }
   }
-
-  function stopRecording() {
-    if (!recording || !recorder) return;
-    recording = false;
-    try { recorder.stop(); } catch (e) { /* ignora */ }
-    recorder = null;
-    if (listening) { setState("listening"); hintEl.textContent = "Microfone ligado — pode falar"; }
+  function endRolling() {
+    var rec = rollingRecorder;
+    rollingRecorder = null; rollingChunks = []; captureFrom = null; flushPending = false; recording = false;
+    if (rec) { try { rec.stop(); } catch (err) {} }
   }
-
+  function sendSegment(pieces) {
+    if (!pieces || !pieces.length) return;
+    var blob = new Blob(pieces,{type:mimeType || "audio/webm"});
+    if (blob.size < 800) return;
+    setState("transcribing");
+    blobToBase64(blob).then(function(data) { sendObj({type:"audio",data:data,suffix:suffixFor(mimeType)}); });
+  }
   function monitor() {
     if (!listening) { rafId = null; return; }
-    if (analyser && timeData) {
-      if (busy || playingAudio) {
-        if (recording) { recording = false; try { if (recorder) recorder.stop(); } catch (e) {} recorder = null; chunks = []; }
-      } else {
-        analyser.getByteTimeDomainData(timeData);
-        var sum = 0;
-        for (var i = 0; i < timeData.length; i++) {
-          var v = (timeData[i] - 128) / 128;
-          sum += v * v;
-        }
-        var rms = Math.sqrt(sum / timeData.length);
-        var now = performance.now();
-        if (rms > 0.022) {
-          lastVoice = now;
-          if (!recording) startRecording();
-        } else if (recording && now - lastVoice > 1100) {
-          stopRecording();
-        }
+    analyser.getByteTimeDomainData(timeData);
+    var sum = 0;
+    for (var i=0;i<timeData.length;i++) { var value=(timeData[i]-128)/128; sum += value*value; }
+    var rms = Math.sqrt(sum/timeData.length), now = performance.now();
+    var threshold = playingAudio ? Math.max(0.055,noiseFloor*3.5) : Math.max(0.018,noiseFloor*2.5);
+    if (rms > threshold) {
+      if (!recording) {
+        recording = true; utteranceStart = now;
+        // Inclui blocos anteriores para não perder o início da fala.
+        captureFrom = Math.max(0, rollingChunks.length - PRE_ROLL_CHUNKS);
       }
+      lastVoice = now;
+    } else if (recording && (now - lastVoice > 700 || now - utteranceStart > MAX_UTTERANCE_MS)) {
+      recording = false;
+      if (rollingRecorder && rollingRecorder.state === "recording") {
+        flushPending = true;
+        try { rollingRecorder.requestData(); } catch (err) { flushPending = false; }
+      }
+    } else if (!recording && !playingAudio) {
+      noiseFloor = noiseFloor*0.98 + Math.min(rms,0.025)*0.02;
     }
     rafId = requestAnimationFrame(monitor);
   }
-
   async function toggleMic() {
     if (listening) {
-      listening = false;
-      stopRecording();
-      micBtn.classList.remove("on");
+      listening = false; endRolling();
       if (rafId) cancelAnimationFrame(rafId);
       rafId = null;
-      setState("idle");
-      hintEl.textContent = "Microfone desligado";
-      addActivity("🎙️ Microfone desligado");
-      return;
+      if (mediaStream) mediaStream.getTracks().forEach(function(track) { track.stop(); });
+      mediaStream = null;
+      if (audioCtx) audioCtx.close(); audioCtx = null;
+      micBtn.classList.remove("on"); setState("idle");
+      hintEl.textContent = "Microfone desligado"; return;
     }
-    var ok = await ensureMic();
-    if (!ok) return;
-    listening = true;
-    lastVoice = performance.now();
-    micBtn.classList.add("on");
-    setState("listening");
-    hintEl.textContent = "Microfone ligado — pode falar";
-    addActivity("🎙️ Microfone ligado — pode falar");
+    if (!await ensureMic()) return;
+    listening = true; lastVoice = performance.now(); recording = false;
+    beginRolling();
+    micBtn.classList.add("on"); setState("listening");
+    hintEl.textContent = "Pode falar. Você pode interromper a resposta falando ou pelo botão.";
     monitor();
   }
-  micBtn.addEventListener("click", toggleMic);
+  micBtn.addEventListener("click",toggleMic);
+
+  // A câmera é somente uma prévia no navegador: nenhum quadro é enviado ao servidor.
+  var cameraStream = null;
+  async function toggleCamera() {
+    if (cameraStream) {
+      cameraStream.getTracks().forEach(function(track) { track.stop(); });
+      cameraStream = null; $("cameraVideo").srcObject = null;
+      $("cameraPanel").hidden = true; $("cameraBtn").textContent = "Ligar câmera";
+      $("cameraBtn").setAttribute("aria-pressed","false"); return;
+    }
+    try {
+      cameraStream = await navigator.mediaDevices.getUserMedia({video:{width:{ideal:640},height:{ideal:480}},audio:false});
+      $("cameraVideo").srcObject = cameraStream; $("cameraPanel").hidden = false;
+      $("cameraBtn").textContent = "Desligar câmera";
+      $("cameraBtn").setAttribute("aria-pressed","true");
+    } catch (err) { addMessage("error","Não consegui abrir a câmera: " + err.message); }
+  }
+  $("cameraBtn").addEventListener("click",toggleCamera);
+  window.addEventListener("pagehide",function() {
+    stopPlayback();
+    [mediaStream,cameraStream].forEach(function(stream) { if (stream) stream.getTracks().forEach(function(t) { t.stop(); }); });
+  });
+
 
   // ---------- Text input ----------
   function submitText() {
@@ -632,6 +720,7 @@
   });
 
   $("resetBtn").addEventListener("click", function () {
+    interrupt();
     sendObj({ type: "reset" });
     chatEl.innerHTML = "";
   });

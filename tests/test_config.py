@@ -28,5 +28,24 @@ class ConfigurationTests(unittest.TestCase):
                 _read_bool("JARVIS_TEST_FLAG", True)
 
 
+class OllamaConfigurationTests(unittest.TestCase):
+    def test_local_chain_needs_no_gemini_key(self):
+        from jarvis import config
+        with patch.object(config, "PROVIDER_CHAIN", ("ollama:qwen2.5:7b-instruct-q4_K_M", "ollama:llama3.1:8b")), patch.object(config, "LIVE_MODE", False), patch.object(config, "get_gemini_api_key", side_effect=AssertionError("Sem Gemini")):
+            config.validate_provider_configuration()
+
+    def test_ollama_url_requires_native_root(self):
+        from jarvis import config
+        with patch.object(config, "PROVIDER_CHAIN", ("ollama",)), patch.object(config, "OLLAMA_BASE_URL", "http://localhost:11434/v1"):
+            with self.assertRaises(config.ConfigurationError):
+                config.validate_provider_configuration()
+
+    def test_full_model_tag_parsing(self):
+        from jarvis.failover import parse_target
+        target = parse_target("ollama:qwen2.5:7b-instruct-q4_K_M")
+        self.assertEqual(target.kind, "ollama")
+        self.assertEqual(target.model, "qwen2.5:7b-instruct-q4_K_M")
+
+
 if __name__ == "__main__":
     unittest.main()

@@ -1,7 +1,7 @@
 """Failover automático entre provedores de LLM.
 
 A cadeia de alvos (``JARVIS_PROVIDER_CHAIN``) define a ordem de preferência,
-por exemplo ``zen:qwen3.6-plus-free,zen:glm-5-free,gemini``. Quando um alvo
+por exemplo ``ollama:qwen2.5:7b-instruct-q4_K_M,ollama:llama3.1:8b``. Quando um alvo
 responde com erro de cota/limite (``429``, ``RESOURCE_EXHAUSTED``, chave
 inválida, sobrecarga...), ele fica *esgotado* por um período (cooldown) e as
 próximas requisições partem direto para o seguinte alvo da cadeia.
@@ -28,10 +28,10 @@ logger = logging.getLogger(__name__)
 
 STATE_FILE = Path.home() / ".jarvis" / "provider_state.json"
 
-_VALID_KINDS = {"gemini", "openai", "zen"}
+_VALID_KINDS = {"gemini", "ollama"}
 
 # Códigos HTTP que sempre indicam provedor indisponível (cota/chave/sobrecarga).
-_UNAVAILABLE_STATUS = {401, 403, 429, 503}
+_UNAVAILABLE_STATUS = {401, 402, 403, 404, 408, 429, 500, 502, 503, 504}
 
 # Marcadores de texto que indicam limite atingido, mesmo sem código útil.
 _UNAVAILABLE_MARKERS = (
@@ -39,6 +39,8 @@ _UNAVAILABLE_MARKERS = (
     "503",
     "401",
     "403",
+    "retornou 402:", "retornou 404:", "retornou 408:",
+    "retornou 500:", "retornou 502:", "retornou 504:",
     "resource_exhausted",
     "rate limit",
     "rate_limit",
@@ -59,6 +61,11 @@ _UNAVAILABLE_MARKERS = (
     "model unavailable",
     "service unavailable",
     "upstream request failed",
+    "timeout", "timed out", "conexão recusada", "connection refused",
+    "falha ao contatar o provedor", "falha ao contatar o ollama",
+    "gemini_api_key não está configurada",
+    "ollama retornou 404:", "ollama retornou 500:", "ollama retornou 503:",
+    "requires more system memory", "out of memory", "model runner has unexpectedly stopped",
 )
 
 _RETRY_RE = re.compile(
@@ -100,7 +107,7 @@ class RetriableProviderError(RuntimeError):
 
 
 def parse_target(raw: str) -> Target:
-    """Converte ``"zen:qwen3.6-plus-free"`` em ``Target`` (``ValueError`` se inválido)."""
+    """Converte ``"ollama:qwen2.5:7b-instruct-q4_K_M"`` em ``Target`` (``ValueError`` se inválido)."""
     kind, _, model = (raw or "").partition(":")
     kind = kind.strip().lower()
     model = model.strip() or None
@@ -195,7 +202,7 @@ def mark_exhausted(
 ) -> None:
     """Marca ``target`` como esgotado, respeitando o prazo indicado no erro."""
     if seconds is None and error is not None:
-        seconds = parse_retry_delay(str(error))
+        seconds = getattr(error, "retry_after", None) or parse_retry_delay(str(error))
     if seconds is None:
         seconds = config.FAILOVER_COOLDOWN
     seconds = max(5.0, min(float(seconds), 24 * 3600))
@@ -253,7 +260,6 @@ def candidates() -> list[Target]:
 def exhausted_message() -> str:
     """Mensagem amigável quando nenhum alvo da cadeia respondeu."""
     return (
-        "Todos os provedores de IA estão temporariamente indisponíveis "
-        "(cotas esgotadas). Tente novamente mais tarde — o Jarvis volta a "
-        "tentar sozinho assim que a cota liberar."
+        "Nenhum modelo da cadeia está disponível. Tente novamente mais tarde "
+        "ou verifique se o Ollama está em execução e se os modelos estão instalados."
     )

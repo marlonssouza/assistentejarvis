@@ -1,6 +1,7 @@
 import contextlib
 import contextvars
 import logging
+import threading
 from typing import Callable
 
 from .config import CONFIRM_CHANNEL, CONFIRM_MODE
@@ -40,6 +41,68 @@ def register_confirm_handler(handler: Callable[[str, str], bool] | None) -> None
     _confirm_handler = handler
 
 
+_session_handler = contextvars.ContextVar("jarvis_session_handler", default=None)
+_cancel_event = contextvars.ContextVar("jarvis_cancel_event", default=None)
+_cancel_callbacks_lock = threading.Lock()
+_cancel_callbacks: dict[threading.Event, set[Callable[[], None]]] = {}
+
+class TurnCancelled(RuntimeError):
+    """O pedido foi interrompido; não executar novas ferramentas."""
+
+def cancellation_enabled():
+    return _cancel_event.get() is not None
+
+def check_cancelled():
+    event = _cancel_event.get()
+    if event is not None and event.is_set():
+        raise TurnCancelled("Pedido interrompido pelo usuário.")
+
+def register_cancel_callback(callback: Callable[[], None]) -> Callable[[], None]:
+    """Register a resource closer that can interrupt a blocked turn operation."""
+    event = _cancel_event.get()
+    if event is None:
+        return lambda: None
+    with _cancel_callbacks_lock:
+        if event.is_set():
+            call_now = True
+        else:
+            _cancel_callbacks.setdefault(event, set()).add(callback)
+            call_now = False
+    if call_now:
+        callback()
+
+    def unregister() -> None:
+        with _cancel_callbacks_lock:
+            callbacks = _cancel_callbacks.get(event)
+            if callbacks is not None:
+                callbacks.discard(callback)
+                if not callbacks:
+                    _cancel_callbacks.pop(event, None)
+
+    return unregister
+
+def cancel_session(event: threading.Event) -> None:
+    """Signal cancellation and close any currently registered blocking resources."""
+    event.set()
+    with _cancel_callbacks_lock:
+        callbacks = tuple(_cancel_callbacks.pop(event, ()))
+    for callback in callbacks:
+        try:
+            callback()
+        except Exception:
+            logger.exception("Não foi possível fechar um recurso do turno interrompido.")
+
+@contextlib.contextmanager
+def session_context(handler, cancelled):
+    h = _session_handler.set(handler)
+    c = _cancel_event.set(cancelled)
+    try:
+        yield
+    finally:
+        _session_handler.reset(h)
+        _cancel_event.reset(c)
+
+
 def needs_confirmation(risk: str) -> bool:
     """Decide, pelo risco da ação, se a confirmação do usuário é necessária."""
     if CONFIRM_MODE == "never":
@@ -56,7 +119,7 @@ def confirmation_uses_microphone() -> bool:
     microfone da sessão em tempo real; nesse caso o próprio modelo conduz a
     confirmação falada, em vez de o código abrir um segundo stream de captura.
     """
-    return _confirm_handler is None and CONFIRM_CHANNEL != "terminal"
+    return (_session_handler.get() or _confirm_handler) is None and CONFIRM_CHANNEL != "terminal"
 
 
 def _ask_terminal(description: str) -> bool:
@@ -102,15 +165,19 @@ def confirm_action(description: str, risk: str = DANGEROUS) -> bool:
     Se uma interface tiver registrado um handler (ex.: a UI web), ele é usado;
     caso contrário, cai no canal configurado (voz ou terminal).
     """
+    check_cancelled()
+    handler = _session_handler.get() or _confirm_handler
     if is_pre_approved():
         logger.info("Ação pré-aprovada pelo plano: %s", description)
         return True
     if not needs_confirmation(risk):
         logger.info("Ação autorizada automaticamente: %s", description)
         return True
-    if _confirm_handler is not None:
+    if handler is not None:
         try:
-            return bool(_confirm_handler(description, risk))
+            return bool(handler(description, risk))
+        except TurnCancelled:
+            raise
         except Exception:  # noqa: BLE001 - confirmação nunca deve quebrar a ação
             logger.exception(
                 "Confirmação pela interface falhou; usando o canal padrão."

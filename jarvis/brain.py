@@ -1,5 +1,8 @@
+import asyncio
 import json
 import logging
+import re
+import threading
 from pathlib import Path
 
 from google.genai import types
@@ -13,6 +16,28 @@ from .config import (
 from .hands import execute_tool
 
 logger = logging.getLogger(__name__)
+
+CONVERSATION_STYLE = (
+    "PERSONA PRIORITÁRIA: você é o J.A.R.V.I.S., um assistente pessoal sofisticado "
+    "que roda localmente neste computador por meio do Ollama. Responda em português "
+    "brasileiro com formalidade britânica natural: seja impecavelmente educado, polido "
+    "e formal, e dirija-se ao usuário como 'Senhor'. Mantenha as respostas faladas "
+    "dinâmicas e muito concisas, em uma a três frases; dê mais detalhes quando forem "
+    "solicitados ou necessários. Use ironia fina, sarcasmo sutil e humor seco com "
+    "moderação, sobretudo diante de perguntas óbvias ou pequenos equívocos, sem "
+    "humilhar, hostilizar ou atrapalhar uma resposta útil. Não repita apresentações "
+    "nem 'como posso ajudar' a cada fala. Se perguntarem sua identidade, descreva "
+    "com precisão que é o J.A.R.V.I.S. executado localmente com Ollama; não alegue "
+    "ser humano, consciente ou ter capacidades que não possui. Faça uma pergunta "
+    "curta se não entender. Uma palavra isolada ou uma transcrição incerta não "
+    "confirma o nome do usuário. "
+    "Nunca invente imagens, capturas de tela, URLs ou resultados de ferramentas. "
+    "Só afirme que executou algo após o resultado real. Não peça novamente em texto "
+    "uma confirmação que o aplicativo já fornece. Não finja ter sentimentos ou enxergar "
+    "o usuário: a câmera desta interface é apenas prévia local, sem análise de imagens. "
+    "Não acione ferramentas para uma saudação ou conversa simples."
+)
+_conversation_lock = threading.Lock()
 
 SYSTEM_INSTRUCTION = (
     "Você é o J.A.R.V.I.S., um assistente pessoal em português, analítico, direto e "
@@ -48,6 +73,13 @@ SYSTEM_INSTRUCTION = (
     "políticas/skills do usuário (list_skills), já são aplicados automaticamente "
     "ao contexto. Para usar ferramentas externas via MCP, chame mcp_list_tools "
     "para ver o que existe e depois mcp_call (exige confirmação). "
+    "Para consultar código e arquivos do GitHub, prefira github_get_file_contents, "
+    "que é somente leitura e não precisa descobrir ferramentas antes. Extraia owner "
+    "e repo da URL github.com/owner/repo; path é relativo ao repositório e vazio "
+    "lista a raiz. Use ref só quando uma branch/tag/commit foi informada. "
+    "Se não souber o caminho, liste a raiz primeiro. Se truncated=true, explique "
+    "que leu apenas parte do conteúdo; não invente o restante. Não use run_command "
+    "para buscar tokens nem peça credenciais no chat. "
     "Quando o usuário pedir para você 'olhar' a tela, use a ferramenta capture_screen; "
     "ela exige confirmação e a imagem capturada será enviada a você em seguida. "
     "As ferramentas de risco (abrir aplicativos, clicar, digitar, atalhos, escrever "
@@ -606,6 +638,24 @@ TOOL_DECLARATIONS = [
                 parameters=types.Schema(type=types.Type.OBJECT, properties={}),
             ),
             types.FunctionDeclaration(
+                name="github_get_file_contents",
+                description=(
+                    "Lê arquivo ou lista pasta de um repositório GitHub via MCP oficial, "
+                    "somente leitura. Informe owner, repo e path; path vazio lista a raiz. "
+                    "Sem acesso ao disco local; credenciais são gerenciadas pelo aplicativo."
+                ),
+                parameters=types.Schema(
+                    type=types.Type.OBJECT,
+                    properties={
+                        "owner": types.Schema(type=types.Type.STRING, description="Dono do repositório; exemplo: github."),
+                        "repo": types.Schema(type=types.Type.STRING, description="Nome do repositório; exemplo: github-mcp-server."),
+                        "path": types.Schema(type=types.Type.STRING, description="Caminho relativo, exemplo LICENSE; vazio para listar a raiz."),
+                        "ref": types.Schema(type=types.Type.STRING, description="Branch, tag ou commit opcional; omita para usar a branch padrão."),
+                    },
+                    required=["owner", "repo", "path"],
+                ),
+            ),
+            types.FunctionDeclaration(
                 name="mcp_list_tools",
                 description=(
                     "Lista as ferramentas disponíveis nos servidores MCP "
@@ -883,8 +933,8 @@ def _ensure_history_loaded() -> None:
 
 
 def build_system_instruction(prompt: str = "") -> str:
-    """Instrução de sistema + perfil, fatos relevantes e políticas aplicáveis."""
-    blocks = [SYSTEM_INSTRUCTION]
+    """Persona prioritária, regras operacionais e contexto aplicável."""
+    blocks = [CONVERSATION_STYLE, SYSTEM_INSTRUCTION]
     try:
         profile = persona.persona_block()
         if profile:
@@ -993,17 +1043,84 @@ def _read_text(response) -> str:
         text = response.text
     except (AttributeError, ValueError) as exc:
         raise RuntimeError(
-            "O Gemini não retornou uma resposta de texto. "
+            "O provedor não retornou uma resposta de texto. "
             "Verifique o bloqueio de conteúdo ou o estado da API."
         ) from exc
     if not text:
         raise RuntimeError(
-            "O Gemini retornou uma resposta vazia. Tente reformular o pedido."
+            "O provedor retornou uma resposta vazia. Tente reformular o pedido."
         )
     return text
 
 
-def _run_turn(target, prompt: str, contents, approved_plan: bool) -> str:
+class _SentenceBuffer:
+    """Emite frases completas à medida que chegam os fragmentos do modelo."""
+
+    def __init__(self, callback) -> None:
+        self.callback = callback
+        self.pending = ""
+        self.emitted = 0
+
+    def feed(self, text: str) -> None:
+        if not self.callback or not text:
+            return
+        self.pending += text
+        while True:
+            match = re.search(r"[.!?]", self.pending)
+            if match is None:
+                return
+            sentence = self.pending[: match.end()].strip()
+            self.pending = self.pending[match.end() :].lstrip()
+            self._emit(sentence)
+
+    def flush(self) -> None:
+        self._emit(self.pending.strip())
+        self.pending = ""
+
+    def _emit(self, sentence: str) -> None:
+        if not sentence or not self.callback:
+            return
+        try:
+            self.callback(sentence)
+        except Exception:
+            logger.exception("Não foi possível encaminhar uma frase para síntese.")
+        else:
+            self.emitted += 1
+
+
+def _send_message(chat, contents, sentence_buffer: _SentenceBuffer):
+    """Consome assincronamente o stream do Ollama; mantém compatibilidade Gemini."""
+    stream_message = getattr(chat, "stream_message", None)
+    if not callable(stream_message):
+        response = chat.send_message(contents)
+        sentence_buffer.feed(getattr(response, "text", "") or "")
+        sentence_buffer.flush()
+        return response
+
+    async def consume_stream():
+        response = None
+        async for update in stream_message(contents):
+            delta = getattr(update, "text_delta", "")
+            if delta:
+                sentence_buffer.feed(delta)
+            final_response = getattr(update, "response", None)
+            if final_response is not None:
+                response = final_response
+        if response is None:
+            raise RuntimeError("O stream do Ollama terminou sem resposta final.")
+        sentence_buffer.flush()
+        return response
+
+    return asyncio.run(consume_stream())
+
+
+def _run_turn(
+    target,
+    prompt: str,
+    contents,
+    approved_plan: bool,
+    on_sentence=None,
+) -> str:
     """Executa um turno completo em ``target`` e devolve a resposta final.
 
     Erros de cota ocorridos **antes** de qualquer ferramenta rodar viram
@@ -1011,26 +1128,29 @@ def _run_turn(target, prompt: str, contents, approved_plan: bool) -> str:
     sem risco de duplicar efeitos colaterais. Depois de haver efeitos, o erro
     sobe como está (o alvo é marcado, mas o turno não é repetido).
     """
-    chat = _new_chat(prompt, target)
     effects_started = False
+    sentence_buffer = _SentenceBuffer(on_sentence)
     try:
+        chat = _new_chat(prompt, target)
         # Se o plano foi aprovado, as ações deste turno não pedem confirmação de novo.
         with security.pre_approved(approved_plan):
-            response = chat.send_message(contents)
+            response = _send_message(chat, contents, sentence_buffer)
             for _ in range(MAX_TOOL_CALLS_PER_TURN):
+                security.check_cancelled()
                 function_calls = response.function_calls or []
                 if not function_calls:
                     break
 
-                effects_started = True
                 function_results = []
                 captured_images: list[str] = []
                 for function_call in function_calls:
+                    security.check_cancelled()
                     if not isinstance(function_call.args, dict):
                         raise RuntimeError(
                             f"Argumentos inválidos para a ferramenta {function_call.name}."
                         )
                     try:
+                        effects_started = True
                         result = execute_tool(function_call.name, function_call.args)
                         function_response = {"result": result}
                         if function_call.name == "capture_screen":
@@ -1050,22 +1170,29 @@ def _run_turn(target, prompt: str, contents, approved_plan: bool) -> str:
                             response=function_response,
                         )
                     )
-                response = chat.send_message(function_results)
+                response = _send_message(chat, function_results, sentence_buffer)
 
                 if captured_images:
-                    response = chat.send_message(
-                        _build_capture_message(captured_images)
+                    response = _send_message(
+                        chat,
+                        _build_capture_message(captured_images),
+                        sentence_buffer,
                     )
             else:
                 if response.function_calls:
                     raise RuntimeError(
-                        f"O Gemini excedeu o limite de {MAX_TOOL_CALLS_PER_TURN} chamadas "
+                        f"O provedor excedeu o limite de {MAX_TOOL_CALLS_PER_TURN} chamadas "
                         "de ferramentas nesta solicitação."
                     )
     except Exception as exc:  # noqa: BLE001 - classificado pelo failover
-        if not effects_started and failover.is_quota_error(exc):
+        if (
+            not effects_started
+            and sentence_buffer.emitted == 0
+            and failover.is_quota_error(exc)
+        ):
             raise failover.RetriableProviderError(target, exc) from exc
         raise
+    security.check_cancelled()
     return _read_text(response)
 
 
@@ -1087,7 +1214,22 @@ def _draft_plan_with_failover(prompt: str, image_path: str | None) -> str:
     return ""
 
 
-def chat_with_vision(prompt: str, image_path: str | None = None) -> str:
+def chat_with_vision(
+    prompt: str,
+    image_path: str | None = None,
+    on_sentence=None,
+) -> str:
+    # Evita misturar histórico e ferramentas entre pedidos/abas concorrentes.
+    with _conversation_lock:
+        security.check_cancelled()
+        return _chat_with_vision(prompt, image_path, on_sentence)
+
+
+def _chat_with_vision(
+    prompt: str,
+    image_path: str | None = None,
+    on_sentence=None,
+) -> str:
     _ensure_history_loaded()
 
     approved_plan = False
@@ -1113,11 +1255,14 @@ def chat_with_vision(prompt: str, image_path: str | None = None) -> str:
     last_error: BaseException | None = None
     for target in failover.candidates():
         try:
-            answer = _run_turn(target, prompt, contents, approved_plan)
+            answer = _run_turn(
+                target, prompt, contents, approved_plan, on_sentence=on_sentence
+            )
         except failover.RetriableProviderError as exc:
             # Cota estourada antes de qualquer efeito: tenta o próximo alvo.
             last_error = exc.original
             failover.mark_exhausted(target, error=exc.original)
+            providers.release_target(target)
             logger.warning(
                 "Provedor %s esgotado; tentando o próximo alvo da cadeia.", target
             )
@@ -1129,11 +1274,14 @@ def chat_with_vision(prompt: str, image_path: str | None = None) -> str:
                 failover.mark_exhausted(target, error=exc)
             raise
         failover.recover(target)
+        from . import events
+        events.emit({"type": "info", "text": f"LLM ativo: {target}"})
         if last_error is not None:
             logger.info(
                 "Failover concluído: %s respondeu após esgotar outro(s) alvo(s).",
                 target,
             )
+        security.check_cancelled()
         _record_turn(prompt, answer)
         return answer
 

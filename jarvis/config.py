@@ -1,4 +1,3 @@
-import json
 import os
 import re
 from pathlib import Path
@@ -61,6 +60,19 @@ def _read_int(name: str, default: int, minimum: int = 1) -> int:
     return parsed
 
 
+def _read_float(
+    name: str, default: float, minimum: float = 0.0, maximum: float = 1.0
+) -> float:
+    raw = os.getenv(name, "").strip()
+    if not raw:
+        return default
+    try:
+        value = float(raw)
+    except ValueError as exc:
+        raise ConfigurationError(f"{name} deve ser um número.") from exc
+    return max(minimum, min(value, maximum))
+
+
 def _read_choice(name: str, default: str, choices: set[str]) -> str:
     value = os.getenv(name, default).strip().lower()
     if value not in choices:
@@ -70,7 +82,9 @@ def _read_choice(name: str, default: str, choices: set[str]) -> str:
 
 
 def _read_wake_words() -> tuple[str, ...]:
-    raw = os.getenv("JARVIS_WAKE_WORDS", "jarvis,ei jarvis,hey jarvis")
+    raw = os.getenv(
+        "JARVIS_WAKE_WORDS", "jarvis,ei jarvis,hey jarvis"
+    )
     words = tuple(word.strip().casefold() for word in raw.split(",") if word.strip())
     return words or ("jarvis",)
 
@@ -90,6 +104,12 @@ TTS_BACKEND = os.getenv("JARVIS_TTS_BACKEND", "edge").strip().lower()
 TTS_VOICE = os.getenv("JARVIS_TTS_VOICE", "pt-BR-AntonioNeural").strip()
 TTS_RATE = os.getenv("JARVIS_TTS_RATE", "").strip()
 TTS_VOLUME = os.getenv("JARVIS_TTS_VOLUME", "").strip()
+
+# Reconhecimento local de fala (STT).
+STT_MODEL = _read_choice("JARVIS_STT_MODEL", "tiny", {"tiny", "base"})
+STT_MODEL_DIR = os.getenv("JARVIS_STT_MODEL_DIR", "").strip()
+# Sensibilidade do VAD: menor = capta fala mais suave (0,05 a 0,95).
+VAD_THRESHOLD = _read_float("JARVIS_VAD_THRESHOLD", 0.35, 0.05, 0.95)
 
 # Pesquisa na web (usa o Gemini com grounding do Google).
 SEARCH_MODEL = os.getenv("JARVIS_SEARCH_MODEL", MODEL_NAME).strip()
@@ -146,6 +166,9 @@ EXTRA_ALLOWED_DIRS = _configured_dirs if _configured_dirs else _default_allowed_
 MEMORY_FILE = Path(
     os.getenv("JARVIS_MEMORY_FILE", str(Path.home() / ".jarvis" / "memory.json"))
 ).expanduser()
+LOG_FILE = Path(
+    os.getenv("JARVIS_LOG_FILE", str(Path.home() / ".jarvis" / "logs" / "jarvis.log"))
+).expanduser()
 
 # Automação de navegador (Playwright). Usa o Chrome instalado por padrão.
 BROWSER_HEADLESS = _read_bool("JARVIS_BROWSER_HEADLESS", False)
@@ -174,54 +197,18 @@ MCP_CONFIG = Path(
 ).expanduser()
 MCP_TIMEOUT_SECONDS = _read_int("JARVIS_MCP_TIMEOUT", 30)
 
-# Provedores de LLM. "gemini" (padrão) usa o Google GenAI; "openai" fala com
-# qualquer endpoint compatível com a API da OpenAI (OpenAI, Ollama, LM Studio,
-# OpenRouter, Groq...); "zen" usa as LLMs gratuitas do console OpenCode.
-PROVIDER = _read_choice("JARVIS_PROVIDER", "gemini", {"gemini", "openai", "zen"})
-OPENAI_BASE_URL = os.getenv(
-    "JARVIS_OPENAI_BASE_URL", "https://api.openai.com/v1"
-).strip().rstrip("/")
-OPENAI_API_KEY = os.getenv("JARVIS_OPENAI_API_KEY", "").strip()
-OPENAI_MODEL = os.getenv("JARVIS_OPENAI_MODEL", "gpt-4o-mini").strip()
-
-
-def _read_opencode_key() -> str:
-    """Lê a chave do console OpenCode (Zen) da instalação local, se existir."""
-    for path in (
-        Path.home() / ".local" / "share" / "opencode" / "auth.json",
-        Path.home() / ".config" / "opencode" / "auth.json",
-    ):
-        try:
-            data = json.loads(path.read_text(encoding="utf-8"))
-            key = (data.get("opencode") or {}).get("key")
-        except (OSError, ValueError):
-            continue
-        if isinstance(key, str) and key.strip():
-            return key.strip()
-    return ""
-
-
-# Zen (OpenCode) — LLMs gratuitas. A chave vem de JARVIS_ZEN_API_KEY, depois de
-# OPENCODE_API_KEY e, por fim, da própria instalação do OpenCode (auth.json).
-ZEN_BASE_URL = os.getenv(
-    "JARVIS_ZEN_BASE_URL", "https://opencode.ai/inference/openai/v1"
-).strip().rstrip("/")
-ZEN_API_KEY = (
-    os.getenv("JARVIS_ZEN_API_KEY", "").strip()
-    or os.getenv("OPENCODE_API_KEY", "").strip()
-    or _read_opencode_key()
-)
-ZEN_MODEL = os.getenv("JARVIS_ZEN_MODEL", "qwen3.6-plus-free").strip()
-
-# Failover: cadeia de alvos na ordem de preferência (ex.: "zen,gemini").
-# Vazia = usa apenas JARVIS_PROVIDER (comportamento original, sem failover).
-PROVIDER_CHAIN = tuple(
-    item.strip()
-    for item in os.getenv("JARVIS_PROVIDER_CHAIN", "").split(",")
-    if item.strip()
-)
-# Segundos que um provedor fica fora da cadeia após um erro de cota (padrão: 6h).
-FAILOVER_COOLDOWN = _read_int("JARVIS_FAILOVER_COOLDOWN", 21_600, 60)
+# Ollama local é o padrão. Gemini permanece opcional para Live/visão.
+PROVIDER = _read_choice("JARVIS_PROVIDER", "ollama", {"ollama", "gemini"})
+OLLAMA_BASE_URL = os.getenv("JARVIS_OLLAMA_BASE_URL", "http://127.0.0.1:11434").strip().rstrip("/")
+OLLAMA_MODEL = os.getenv("JARVIS_OLLAMA_MODEL", "qwen2.5:7b-instruct-q4_K_M").strip()
+OLLAMA_TIMEOUT = _read_int("JARVIS_OLLAMA_TIMEOUT", 60)
+OLLAMA_NUM_CTX = _read_int("JARVIS_OLLAMA_NUM_CTX", 8192, 1024)
+OLLAMA_MAX_TOKENS = _read_int("JARVIS_OLLAMA_MAX_TOKENS", 384, 32)
+OLLAMA_NUM_BATCH = _read_int("JARVIS_OLLAMA_NUM_BATCH", 128)
+OLLAMA_KEEP_ALIVE = os.getenv("JARVIS_OLLAMA_KEEP_ALIVE", "5m").strip()
+_default_chain = "ollama:" + OLLAMA_MODEL + ",ollama:llama3.1:8b" if PROVIDER == "ollama" else "gemini"
+PROVIDER_CHAIN = tuple(item.strip() for item in os.getenv("JARVIS_PROVIDER_CHAIN", _default_chain).split(",") if item.strip())
+FAILOVER_COOLDOWN = _read_int("JARVIS_FAILOVER_COOLDOWN", 60, 5)
 
 # Interface e comportamento
 UI_MODE = _read_choice("JARVIS_UI_MODE", "web", {"web", "compact"})
@@ -233,12 +220,22 @@ OPENWEATHER_API_KEY = os.getenv("OPENWEATHER_API_KEY", "").strip()
 
 
 def active_model_name() -> str:
-    """Nome do modelo do primeiro alvo ativo (cadeia) ou do provedor atual."""
-    raw = PROVIDER_CHAIN[0] if PROVIDER_CHAIN else PROVIDER
-    kind, _, model = raw.partition(":")
-    model = model.strip()
-    if kind == "zen":
-        return model or ZEN_MODEL
-    if kind == "openai":
-        return model or OPENAI_MODEL
-    return model or MODEL_NAME
+    """Nome do primeiro modelo disponível da cadeia configurada."""
+    from . import failover
+    target = failover.candidates()[0]
+    return target.model or (OLLAMA_MODEL if target.kind == "ollama" else MODEL_NAME)
+
+
+def validate_provider_configuration() -> None:
+    """Valida os provedores sem exigir uma chave para inferência local."""
+    from urllib.parse import urlparse
+    from .failover import parse_target
+    targets = [parse_target(raw) for raw in PROVIDER_CHAIN or (PROVIDER,)]
+    if any(target.kind == "ollama" for target in targets):
+        url = urlparse(OLLAMA_BASE_URL)
+        if url.scheme not in {"http", "https"} or not url.hostname or url.path not in {"", "/"}:
+            raise ConfigurationError("JARVIS_OLLAMA_BASE_URL deve ser a raiz do servidor, por exemplo http://127.0.0.1:11434 (sem /v1).")
+    elif any(target.kind == "gemini" for target in targets):
+        get_gemini_api_key()
+    if LIVE_MODE:
+        get_gemini_api_key()
