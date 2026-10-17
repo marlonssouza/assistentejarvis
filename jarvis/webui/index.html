@@ -569,19 +569,16 @@
   // ---------- Microfone com cancelamento de eco e detecção de interrupção ----------
   var mediaStream = null, audioCtx = null, analyser = null, timeData = null;
   var listening = false, recording = false;
-  var lastVoice = 0, rafId = null, mimeType = "";
+  var lastVoice = 0, rafId = null;
   var noiseFloor = 0.008;
-  // Gravação contínua em blocos: preserva o ataque da palavra de ativação,
-  // que antes era cortado por só iniciar a gravação após detectar fala.
-  var rollingRecorder = null, rollingChunks = [], captureFrom = null, flushPending = false;
-  var ROLLING_SLICE_MS = 250, PRE_ROLL_CHUNKS = 2, MAX_ROLLING_CHUNKS = 80;
-  var utteranceStart = 0, MAX_UTTERANCE_MS = 15000;
+  // Captura em PCM bruto (WebAudio) e envio em WAV: evita contêineres
+  // inválidos (WebM cortado) e preserva o ataque da palavra de ativação
+  // guardando um pré-roll de áudio antes da detecção de fala.
+  var sourceNode = null, processor = null, silentGain = null, sampleRate = 0;
+  var pcm = [], pcmSamples = 0, captureStartSample = 0, utteranceStart = 0;
+  var PRE_ROLL_SECONDS = 0.6, IDLE_KEEP_SECONDS = 1.0;
+  var MIN_UTTERANCE_SECONDS = 0.25, MAX_UTTERANCE_SECONDS = 15;
 
-  function pickMime() {
-    var options = ["audio/webm;codecs=opus","audio/webm","audio/ogg;codecs=opus","audio/ogg"];
-    return options.find(function(type) { return window.MediaRecorder && MediaRecorder.isTypeSupported(type); }) || "";
-  }
-  function suffixFor(mime) { return mime.indexOf("ogg") !== -1 ? ".ogg" : ".webm"; }
   async function ensureMic() {
     if (mediaStream) return true;
     try {
@@ -590,9 +587,17 @@
       }});
       audioCtx = new (window.AudioContext || window.webkitAudioContext)();
       await audioCtx.resume();
+      sampleRate = audioCtx.sampleRate;
       analyser = audioCtx.createAnalyser(); analyser.fftSize = 1024;
-      audioCtx.createMediaStreamSource(mediaStream).connect(analyser);
-      timeData = new Uint8Array(analyser.fftSize); mimeType = pickMime();
+      sourceNode = audioCtx.createMediaStreamSource(mediaStream);
+      sourceNode.connect(analyser);
+      processor = audioCtx.createScriptProcessor(4096, 1, 1);
+      processor.onaudioprocess = collectAudio;
+      silentGain = audioCtx.createGain(); silentGain.gain.value = 0;
+      sourceNode.connect(processor);
+      processor.connect(silentGain); silentGain.connect(audioCtx.destination);
+      timeData = new Uint8Array(analyser.fftSize);
+      resetPcm();
       return true;
     } catch (err) {
       if (mediaStream) mediaStream.getTracks().forEach(function(t) { t.stop(); });
@@ -600,39 +605,55 @@
       addMessage("error","Não consegui acessar o microfone: " + err.message); return false;
     }
   }
-  function beginRolling() {
-    if (rollingRecorder || !mediaStream) return;
-    try { rollingRecorder = mimeType ? new MediaRecorder(mediaStream,{mimeType:mimeType}) : new MediaRecorder(mediaStream); }
-    catch (err) { addMessage("error","Falha no microfone: " + err.message); return; }
-    rollingChunks = []; captureFrom = null; flushPending = false;
-    rollingRecorder.ondataavailable = function(e) {
-      if (e.data && e.data.size) rollingChunks.push({t:performance.now(), blob:e.data});
-      if (rollingChunks.length > MAX_ROLLING_CHUNKS) {
-        var drop = rollingChunks.length - MAX_ROLLING_CHUNKS;
-        rollingChunks.splice(0, drop);
-        if (captureFrom !== null) captureFrom = Math.max(0, captureFrom - drop);
+  function resetPcm() { pcm = []; pcmSamples = 0; captureStartSample = 0; }
+  function collectAudio(e) {
+    if (!listening) return;
+    var input = e.inputBuffer.getChannelData(0);
+    var int16 = new Int16Array(input.length);
+    for (var i = 0; i < input.length; i++) {
+      var s = input[i];
+      if (s > 1) s = 1; else if (s < -1) s = -1;
+      int16[i] = s < 0 ? s * 0x8000 : s * 0x7fff;
+    }
+    pcm.push(int16); pcmSamples += int16.length;
+    if (!recording) {
+      // Mantém apenas ~1s de áudio ocioso (para o pré-roll) e descarta o resto.
+      while (pcm.length > 1 && pcmSamples - pcm[0].length >= sampleRate * IDLE_KEEP_SECONDS) {
+        pcmSamples -= pcm[0].length; pcm.shift();
       }
-      if (flushPending) {
-        flushPending = false;
-        var from = captureFrom === null ? 0 : captureFrom;
-        var pieces = rollingChunks.slice(from).map(function(c) { return c.blob; });
-        rollingChunks = []; captureFrom = null;
-        sendSegment(pieces);
-      }
-    };
-    try { rollingRecorder.start(ROLLING_SLICE_MS); } catch (err) { rollingRecorder = null; }
+    }
   }
-  function endRolling() {
-    var rec = rollingRecorder;
-    rollingRecorder = null; rollingChunks = []; captureFrom = null; flushPending = false; recording = false;
-    if (rec) { try { rec.stop(); } catch (err) {} }
+  function encodeWav(startSample, endSample) {
+    var length = endSample - startSample;
+    var buffer = new ArrayBuffer(44 + length * 2);
+    var view = new DataView(buffer);
+    function writeString(offset, text) {
+      for (var i = 0; i < text.length; i++) view.setUint8(offset + i, text.charCodeAt(i));
+    }
+    writeString(0, "RIFF"); view.setUint32(4, 36 + length * 2, true); writeString(8, "WAVE");
+    writeString(12, "fmt "); view.setUint32(16, 16, true); view.setUint16(20, 1, true);
+    view.setUint16(22, 1, true); view.setUint32(24, sampleRate, true);
+    view.setUint32(28, sampleRate * 2, true); view.setUint16(32, 2, true); view.setUint16(34, 16, true);
+    writeString(36, "data"); view.setUint32(40, length * 2, true);
+    var offset = 44, skip = startSample, written = 0;
+    for (var c = 0; c < pcm.length && written < length; c++) {
+      var chunk = pcm[c];
+      if (skip >= chunk.length) { skip -= chunk.length; continue; }
+      var from = skip; skip = 0;
+      var take = Math.min(chunk.length - from, length - written);
+      for (var j = 0; j < take; j++) { view.setInt16(offset, chunk[from + j], true); offset += 2; }
+      written += take;
+    }
+    return new Blob([view], {type:"audio/wav"});
   }
-  function sendSegment(pieces) {
-    if (!pieces || !pieces.length) return;
-    var blob = new Blob(pieces,{type:mimeType || "audio/webm"});
-    if (blob.size < 800) return;
+  function finishUtterance() {
+    var end = pcmSamples, start = captureStartSample || 0;
+    if (end - start < sampleRate * MIN_UTTERANCE_SECONDS) { resetPcm(); return; }
+    var blob = encodeWav(start, end);
+    resetPcm();
+    if (blob.size < 1000) return;
     setState("transcribing");
-    blobToBase64(blob).then(function(data) { sendObj({type:"audio",data:data,suffix:suffixFor(mimeType)}); });
+    blobToBase64(blob).then(function(data) { sendObj({type:"audio",data:data,suffix:".wav"}); });
   }
   function monitor() {
     if (!listening) { rafId = null; return; }
@@ -644,16 +665,13 @@
     if (rms > threshold) {
       if (!recording) {
         recording = true; utteranceStart = now;
-        // Inclui blocos anteriores para não perder o início da fala.
-        captureFrom = Math.max(0, rollingChunks.length - PRE_ROLL_CHUNKS);
+        // Pré-roll: inclui até 0,6s antes para não cortar o início da fala.
+        captureStartSample = Math.max(0, pcmSamples - Math.round(sampleRate * PRE_ROLL_SECONDS));
       }
       lastVoice = now;
-    } else if (recording && (now - lastVoice > 700 || now - utteranceStart > MAX_UTTERANCE_MS)) {
+    } else if (recording && (now - lastVoice > 700 || now - utteranceStart > MAX_UTTERANCE_SECONDS * 1000)) {
       recording = false;
-      if (rollingRecorder && rollingRecorder.state === "recording") {
-        flushPending = true;
-        try { rollingRecorder.requestData(); } catch (err) { flushPending = false; }
-      }
+      finishUtterance();
     } else if (!recording && !playingAudio) {
       noiseFloor = noiseFloor*0.98 + Math.min(rms,0.025)*0.02;
     }
@@ -661,7 +679,10 @@
   }
   async function toggleMic() {
     if (listening) {
-      listening = false; endRolling();
+      listening = false; recording = false; resetPcm();
+      if (processor) { processor.onaudioprocess = null; try { processor.disconnect(); } catch (err) {} processor = null; }
+      if (silentGain) { try { silentGain.disconnect(); } catch (err) {} silentGain = null; }
+      if (sourceNode) { try { sourceNode.disconnect(); } catch (err) {} sourceNode = null; }
       if (rafId) cancelAnimationFrame(rafId);
       rafId = null;
       if (mediaStream) mediaStream.getTracks().forEach(function(track) { track.stop(); });
@@ -672,7 +693,7 @@
     }
     if (!await ensureMic()) return;
     listening = true; lastVoice = performance.now(); recording = false;
-    beginRolling();
+    resetPcm();
     micBtn.classList.add("on"); setState("listening");
     hintEl.textContent = "Pode falar. Você pode interromper a resposta falando ou pelo botão.";
     monitor();

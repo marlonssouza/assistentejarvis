@@ -58,7 +58,7 @@ class VoiceTests(unittest.TestCase):
         options = model.transcribe.call_args.kwargs
         self.assertEqual(options["language"], "pt")
         self.assertEqual(options["beam_size"], 5)
-        self.assertFalse(options["vad_filter"])
+        self.assertTrue(options["vad_filter"])
         self.assertIn("jarvis", options["initial_prompt"].casefold())
         self.assertFalse(os.path.exists(path))
 

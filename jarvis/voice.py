@@ -470,9 +470,10 @@ def transcribe_audio_bytes(data: bytes, suffix: str = ".webm") -> str | None:
             options = {
                 "language": "pt",
                 # beam maior melhora nomes próprios ("Jarvis"); o VAD do
-                # microfone já segmentou a fala, então não repetimos aqui.
+                # Whisper remove silêncio (evita alucinação) e o pré-roll já
+                # garante o ataque da fala.
                 "beam_size": 5,
-                "vad_filter": False,
+                "vad_filter": True,
                 "initial_prompt": (
                     "Transcrição em português do Brasil. Palavras de ativação: "
                     + ", ".join(sorted(WAKE_WORDS))
